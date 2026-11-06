@@ -1,0 +1,31 @@
+# Copy to .dev.vars for `wrangler dev`. In production set each of these with
+#   npx wrangler secret put <NAME>
+# (WEB_URL and COOKIE_SECURE are plain vars in wrangler.toml; .dev.vars overrides them locally.)
+
+# libSQL / Turso database URL.
+#   production: libsql://<db>-<org>.turso.io
+#   local dev : http://127.0.0.1:8080  (the `npm run dev:db` bridge serving file:local.db —
+#               workerd cannot open file: URLs directly; Node scripts and tests use file:local.db)
+TURSO_DATABASE_URL=http://127.0.0.1:8080
+
+# Turso auth token (`turso db tokens create <db>`). Empty for local dev.
+TURSO_AUTH_TOKEN=
+
+# HMAC key for session cookies (ng_session / ng_admin). Any long random string, e.g.
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+SESSION_SECRET=change-me-long-random-string
+
+# HMAC key for signed asset URLs (/assets/:id?exp=&sig=). Long random string, different from above.
+ASSET_SIGNING_SECRET=change-me-another-long-random-string
+
+# Back office login.
+ADMIN_USERNAME=admin
+# PBKDF2 hash from `npm run hash-password -- <password>` (or printed by `npm run seed` for admin1234).
+# Keep it in single quotes.
+ADMIN_PASSWORD_HASH='pbkdf2$100000$<salt-base64>$<hash-base64>'
+
+# Origin of the web app (used for CORS and for member links ${WEB_URL}/m/<linkToken>).
+WEB_URL=http://localhost:5173
+
+# 'true' in production (Secure; SameSite=None cookies), 'false' for local http dev (SameSite=Lax).
+COOKIE_SECURE=false

@@ -1,0 +1,18 @@
+name = "numbergen-api"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Non-secret configuration. For local dev, .dev.vars overrides these values.
+# Secrets (TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, SESSION_SECRET, ASSET_SIGNING_SECRET,
+# ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
+[vars]
+WEB_URL = "https://numbergen-web.pages.dev"
+COOKIE_SECURE = "true"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "numbergen-assets"
+
+[observability]
+enabled = true

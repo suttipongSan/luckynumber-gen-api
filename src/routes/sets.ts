@@ -1,0 +1,167 @@
+// Lottery sets ("ชุดรายการ"). The Default set is created on the first GET /sets and can be
+// neither renamed nor deleted.
+import { Hono } from 'hono'
+import { and, asc, eq, inArray } from 'drizzle-orm'
+import type { AppEnv, LotterySet } from '../types'
+import { MAX_SETS } from '../types'
+import { getDb, type DB } from '../db/client'
+import { setLotteries, sets } from '../db/schema'
+import { requireMember } from '../middleware/memberAuth'
+import { errors, parseJson } from '../lib/http'
+import { newId } from '../lib/ids'
+import { nowIso } from '../lib/time'
+import { existingLotteryIds } from '../lib/views'
+import { patchSetSchema, setNameSchema } from '../validation'
+
+export const DEFAULT_SET_NAME = 'Default'
+/** Same starter list as the mockup's Default set. */
+export const DEFAULT_SET_LOTTERIES = [
+  'hanoi-regular',
+  'hanoi-vip',
+  'lao-pattana',
+  'lao-samakki',
+  'dow-jones',
+  'thai-gov',
+]
+
+export const setRoutes = new Hono<AppEnv>()
+setRoutes.use('/sets', requireMember())
+setRoutes.use('/sets/*', requireMember())
+
+type SetRow = typeof sets.$inferSelect
+
+async function loadSets(db: DB, memberId: string): Promise<LotterySet[]> {
+  const rows = await db
+    .select()
+    .from(sets)
+    .where(eq(sets.memberId, memberId))
+    .orderBy(asc(sets.createdAt), asc(sets.id))
+  return attachLotteries(db, rows)
+}
+
+async function attachLotteries(db: DB, rows: SetRow[]): Promise<LotterySet[]> {
+  if (rows.length === 0) return []
+  const links = await db
+    .select()
+    .from(setLotteries)
+    .where(
+      inArray(
+        setLotteries.setId,
+        rows.map((r) => r.id),
+      ),
+    )
+    .orderBy(asc(setLotteries.sortOrder))
+  const bySet = new Map<string, string[]>()
+  for (const l of links) {
+    const list = bySet.get(l.setId) ?? []
+    list.push(l.lotteryId)
+    bySet.set(l.setId, list)
+  }
+  // Default first, then creation order.
+  const sorted = [...rows].sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
+  return sorted.map((r) => ({
+    id: r.id,
+    name: r.name,
+    isDefault: r.isDefault,
+    lotteryIds: bySet.get(r.id) ?? [],
+  }))
+}
+
+async function ensureDefault(db: DB, memberId: string): Promise<void> {
+  const existing = await db.query.sets.findFirst({
+    where: and(eq(sets.memberId, memberId), eq(sets.isDefault, true)),
+  })
+  if (existing) return
+  const id = newId()
+  const valid = await existingLotteryIds(db, DEFAULT_SET_LOTTERIES)
+  const ids = DEFAULT_SET_LOTTERIES.filter((l) => valid.has(l))
+  try {
+    await db.batch([
+      db.insert(sets).values({
+        id,
+        memberId,
+        name: DEFAULT_SET_NAME,
+        isDefault: true,
+        createdAt: nowIso(),
+      }),
+      ...ids.map((lotteryId, i) =>
+        db.insert(setLotteries).values({ setId: id, lotteryId, sortOrder: i }),
+      ),
+    ])
+  } catch (e) {
+    // A concurrent first GET /sets won the race (unique index sets_one_default_idx); the batch
+    // was rolled back as a whole. Anything else is a real error.
+    const raced = await db.query.sets.findFirst({
+      where: and(eq(sets.memberId, memberId), eq(sets.isDefault, true)),
+    })
+    if (!raced) throw e
+  }
+}
+
+async function ownedSet(db: DB, memberId: string, id: string): Promise<SetRow> {
+  const row = await db.query.sets.findFirst({
+    where: and(eq(sets.id, id), eq(sets.memberId, memberId)),
+  })
+  if (!row) throw errors.notFound('ไม่พบชุดรายการ')
+  return row
+}
+
+setRoutes.get('/sets', async (c) => {
+  const db = getDb(c.env)
+  const memberId = c.get('member').id
+  await ensureDefault(db, memberId)
+  return c.json(await loadSets(db, memberId))
+})
+
+setRoutes.post('/sets', async (c) => {
+  const db = getDb(c.env)
+  const memberId = c.get('member').id
+  const { name } = await parseJson(c, setNameSchema)
+  await ensureDefault(db, memberId)
+  const count = (await db.select({ id: sets.id }).from(sets).where(eq(sets.memberId, memberId)))
+    .length
+  if (count >= MAX_SETS) throw errors.conflict('QUOTA', `สร้างชุดได้สูงสุด ${MAX_SETS} ชุด`)
+  const row: SetRow = { id: newId(), memberId, name, isDefault: false, createdAt: nowIso() }
+  await db.insert(sets).values(row)
+  const out: LotterySet = { id: row.id, name: row.name, isDefault: false, lotteryIds: [] }
+  return c.json(out)
+})
+
+setRoutes.patch('/sets/:id', async (c) => {
+  const db = getDb(c.env)
+  const memberId = c.get('member').id
+  const body = await parseJson(c, patchSetSchema)
+  const row = await ownedSet(db, memberId, c.req.param('id'))
+  if (body.name !== undefined && row.isDefault && body.name !== row.name) {
+    throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถเปลี่ยนชื่อชุด Default ได้')
+  }
+  const ops = []
+  if (body.name !== undefined && !row.isDefault) {
+    ops.push(db.update(sets).set({ name: body.name }).where(eq(sets.id, row.id)))
+  }
+  if (body.lotteryIds !== undefined) {
+    const ids = Array.from(new Set(body.lotteryIds))
+    const valid = await existingLotteryIds(db, ids)
+    const unknown = ids.filter((i) => !valid.has(i))
+    if (unknown.length) throw errors.validation(`ไม่พบหวย: ${unknown.slice(0, 5).join(', ')}`)
+    ops.push(db.delete(setLotteries).where(eq(setLotteries.setId, row.id)))
+    ids.forEach((lotteryId, i) =>
+      ops.push(db.insert(setLotteries).values({ setId: row.id, lotteryId, sortOrder: i })),
+    )
+  }
+  if (ops.length) await db.batch(ops as [(typeof ops)[number], ...(typeof ops)[number][]])
+  const fresh = await ownedSet(db, memberId, row.id)
+  const [out] = await attachLotteries(db, [fresh])
+  return c.json(out)
+})
+
+setRoutes.delete('/sets/:id', async (c) => {
+  const db = getDb(c.env)
+  const row = await ownedSet(db, c.get('member').id, c.req.param('id'))
+  if (row.isDefault) throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถลบชุด Default ได้')
+  await db.batch([
+    db.delete(setLotteries).where(eq(setLotteries.setId, row.id)),
+    db.delete(sets).where(eq(sets.id, row.id)),
+  ])
+  return c.body(null, 204)
+})
