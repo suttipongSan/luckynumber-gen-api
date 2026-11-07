@@ -1,4 +1,4 @@
-// Shared helpers for Node scripts (migrate / seed / dev-db-server).
+// Shared helpers for Node-side tests: open a libSQL file DB and apply drizzle/ migrations.
 // The DB URL comes from the TURSO_DATABASE_URL environment variable, defaulting to the local
 // file `file:local.db` (scripts never read .dev.vars, whose URL points at the dev DB bridge).
 import { createClient } from '@libsql/client'

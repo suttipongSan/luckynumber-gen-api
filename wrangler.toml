@@ -4,11 +4,18 @@ compatibility_date = "2026-10-01"
 compatibility_flags = ["nodejs_compat"]
 
 # Non-secret configuration. For local dev, .dev.vars overrides these values.
-# Secrets (TURSO_DATABASE_URL, TURSO_AUTH_TOKEN, SESSION_SECRET, ASSET_SIGNING_SECRET,
-# ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
+# Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
 [vars]
-WEB_URL = "https://numbergen-web.pages.dev"
+WEB_URL = "https://numbergen-web.luckynumber-01-fpn.workers.dev"
 COOKIE_SECURE = "true"
+
+# Cloudflare D1 (SQLite). Migrations are the drizzle-kit SQL files in drizzle/:
+#   npx wrangler d1 migrations apply numbergen --remote   (or --local for wrangler dev)
+[[d1_databases]]
+binding = "DB"
+database_name = "numbergen"
+database_id = "154fbbeb-f402-4dae-aa63-86f0ecc9c773"
+migrations_dir = "drizzle"
 
 [[r2_buckets]]
 binding = "ASSETS"

@@ -5,6 +5,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm'
 import type { AppEnv, CardNumbers, CardSettings } from '../types'
 import { ASSET_URL_TTL_SECONDS, RENDERS_PER_DAY } from '../types'
 import { getDb } from '../db/client'
+import { chunk, IN_CHUNK } from '../lib/chunk'
 import { assets, cardSettings, lotteries, members, renderCounters } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson } from '../lib/http'
@@ -78,10 +79,15 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   // Sign only assets that belong to this member.
   const signed: Record<string, string> = {}
   if (assetRefs.size) {
-    const owned = await db
-      .select({ id: assets.id })
-      .from(assets)
-      .where(and(eq(assets.memberId, member.id), inArray(assets.id, [...assetRefs])))
+    const owned: { id: string }[] = []
+    for (const part of chunk([...assetRefs], IN_CHUNK)) {
+      owned.push(
+        ...(await db
+          .select({ id: assets.id })
+          .from(assets)
+          .where(and(eq(assets.memberId, member.id), inArray(assets.id, part)))),
+      )
+    }
     const origin = apiOrigin(c.req.url)
     for (const a of owned) {
       signed[a.id] = await signedAssetUrl(origin, c.env.ASSET_SIGNING_SECRET, a.id, ASSET_URL_TTL_SECONDS)

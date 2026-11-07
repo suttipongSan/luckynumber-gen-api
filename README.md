@@ -1,6 +1,6 @@
 # numbergen-api
 
-NumberGen phase 2 API: Hono on Cloudflare Workers, TypeScript, Drizzle ORM + libSQL (Turso),
+NumberGen phase 2 API: Hono on Cloudflare Workers, TypeScript, Drizzle ORM + Cloudflare D1 (SQLite),
 Cloudflare R2 for member assets, zod validation, vitest tests.
 
 The HTTP contract is `../numbergen/API.md` and the agreed design is `../numbergen/DESIGN.md`.
@@ -13,7 +13,8 @@ src/types.ts            shared API types (mirror of web src/api/types.ts) + limi
 src/validation.ts       zod schemas (passthrough CardSettings with API.md bounds)
 src/db/schema.ts        Drizzle tables (DESIGN.md data model)
 src/db/catalog.ts       lottery catalog (seed data, 82 lotteries in 5 groups)
-src/db/client.ts        getDb(env)
+src/db/client.ts        getDb(env): D1 binding in Workers, libSQL file DB in Node tests
+src/lib/chunk.ts        splits IN lists / multi-row inserts under D1's 100-parameter limit
 src/lib/crypto.ts       PBKDF2 passwords, constant-time compare, HMAC, signed asset URLs
 src/lib/session.ts      ng_session / ng_admin cookies (signed id + DB row, 24 h, not refreshed)
 src/lib/numbers.ts      number generation (port of the mockup's lib/numbers.ts)
@@ -22,7 +23,7 @@ src/lib/loginLimiter.ts 5 wrong passwords → 429 for 15 min (login_attempts tab
 src/middleware/         memberAuth (session + expiry/disabled check on every call), adminAuth
 src/routes/             link, me, lotteries, news, sets, settings, render, assets, admin
 drizzle/                generated SQL migrations
-scripts/                migrate, seed, hash-password, dev-db-server (local libSQL bridge)
+scripts/                seed-sql (writes seed.sql for D1), hash-password, db (test helpers)
 test/                   vitest: numbers, crypto/signed URLs, app (app.request + file:test.db + fake R2)
 ```
 
@@ -30,34 +31,26 @@ test/                   vitest: numbers, crypto/signed URLs, app (app.request + 
 
 ```powershell
 npm install
-npm run seed          # applies migrations to file:local.db, seeds lotteries + demo member
+npm run db:migrate    # applies drizzle/ migrations to the local D1 copy (.wrangler/state)
+npm run seed          # lottery catalog + demo member into local D1
 ```
 
-`npm run seed` prints the demo member link
-(`http://localhost:5173/m/demo0000000000000000000000000000`, name `สมาชิกทดสอบ`, no password,
-expires in 30 days) and an `ADMIN_PASSWORD_HASH` for `admin` / `admin1234`. Re-running it is
-safe: lotteries that already exist are left as they are, and the demo member's password is cleared and its
-expiry reset.
+The demo member link is `http://localhost:5173/m/demo0000000000000000000000000000` (name
+`สมาชิกทดสอบ`, no password, expires in 30 days). Re-running `npm run seed` is safe: existing lotteries
+are left as they are, and the demo member's password is cleared and its expiry reset.
+Local admin login is `admin` / `admin1234` (hash in `.dev.vars`).
 
 ## Local development
 
 `.dev.vars` holds the local secrets (git-ignored). A ready-made one is in the repo folder;
 `.dev.vars.example` documents every variable. To recreate it, copy the example, fill in random
-secrets and paste the hash printed by `npm run seed` (keep it in single quotes).
-
-workerd (the runtime behind `wrangler dev`) cannot open `file:` database URLs, because the Workers
-build of `@libsql/client` only speaks HTTP or WebSocket. So local dev runs two processes:
+secrets and paste a hash from `npm run hash-password -- admin1234` (keep it in single quotes).
 
 ```powershell
-# terminal 1: serve local.db over the libSQL HTTP protocol on http://127.0.0.1:8080
-npm run dev:db
-# terminal 2: the Worker on http://localhost:8787 (R2 is simulated locally by wrangler)
-npm run dev
+npm run dev    # the Worker on http://localhost:8787; D1 and R2 are simulated locally by wrangler
 ```
 
-`.dev.vars` points `TURSO_DATABASE_URL` at `http://127.0.0.1:8080`. Node scripts and tests use
-`file:local.db` / `file:test.db` directly. The bridge is for development only: it has no auth and listens only on
-127.0.0.1.
+Tests run in Node against a libSQL file DB (`file:test.db`) with the same schema and migrations.
 
 Quick check:
 
@@ -73,60 +66,32 @@ Other scripts:
 | `npm run typecheck` / `npm run build` | `tsc --noEmit` |
 | `npm test` | vitest (node environment, no Workers runtime needed) |
 | `npm run db:generate` | generate a new migration in `drizzle/` after editing `src/db/schema.ts` |
-| `npm run db:migrate` | apply `drizzle/` migrations to `TURSO_DATABASE_URL` (default `file:local.db`) |
+| `npm run db:migrate` / `db:migrate:remote` | apply `drizzle/` migrations to local / production D1 |
+| `npm run seed` / `seed:remote` | lottery catalog (+ demo member locally only) into local / production D1 |
 | `npm run hash-password -- <password>` | print a PBKDF2 hash for `ADMIN_PASSWORD_HASH` |
 
 ## Production
 
-### 1. Turso database
+Live on the operator's Cloudflare account (all free plan):
+
+| Piece | Resource |
+|---|---|
+| Worker | `numbergen-api` → https://numbergen-api.luckynumber-01-fpn.workers.dev |
+| Database | D1 `numbergen` (binding `DB`, APAC) |
+| Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private) |
+| Web origin | `WEB_URL` in wrangler.toml → https://numbergen-web.luckynumber-01-fpn.workers.dev |
+
+Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`
+(`npx wrangler secret put <NAME>`). Full step-by-step guide: `../numbergen/DEPLOY.md`.
 
 ```powershell
-turso db create numbergen
-turso db show numbergen --url          # libsql://numbergen-<org>.turso.io
-turso db tokens create numbergen       # auth token
+npm run db:migrate:remote   # after adding a migration
+npm run deploy              # wrangler deploy
 ```
 
-Apply the migrations from your machine (PowerShell):
-
-```powershell
-$env:TURSO_DATABASE_URL = "libsql://numbergen-<org>.turso.io"
-$env:TURSO_AUTH_TOKEN = "<token>"
-npm run db:migrate
-npm run seed        # optional: lottery catalog + demo member (WEB_URL env var sets the printed link)
-Remove-Item Env:TURSO_DATABASE_URL, Env:TURSO_AUTH_TOKEN
-```
-
-### 2. R2 bucket
-
-```powershell
-npx wrangler r2 bucket create numbergen-assets
-```
-
-The bucket stays private. Files are served only by the Worker through signed URLs
-(`/assets/:id?exp=&sig=`, valid for 10 minutes).
-
-### 3. Vars and secrets
-
-In `wrangler.toml`, set `[vars] WEB_URL` to the Cloudflare Pages origin of the web app (for
-example `https://numbergen-web.pages.dev`) and keep `COOKIE_SECURE = "true"`. That gives cookies
-`Secure; HttpOnly; SameSite=None`, which cross-origin Pages → Workers calls need.
-
-```powershell
-npx wrangler secret put TURSO_DATABASE_URL
-npx wrangler secret put TURSO_AUTH_TOKEN
-npx wrangler secret put SESSION_SECRET          # long random string
-npx wrangler secret put ASSET_SIGNING_SECRET    # another long random string
-npx wrangler secret put ADMIN_USERNAME
-npx wrangler secret put ADMIN_PASSWORD_HASH     # from: npm run hash-password -- <password>
-```
-
-### 4. Deploy
-
-```powershell
-npm run deploy      # wrangler deploy
-```
-
-Set the web app's `VITE_API_URL` to the Worker URL (for example `https://numbergen-api.<account>.workers.dev`).
+D1 free-plan limits the code respects: at most 100 bound parameters per statement and 50 statements
+per request (each statement in a batch counts). Use `src/lib/chunk.ts` for long `IN` lists and
+multi-row inserts.
 
 ## Behaviour notes
 

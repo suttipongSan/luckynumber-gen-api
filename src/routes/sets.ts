@@ -5,6 +5,7 @@ import { and, asc, eq, inArray } from 'drizzle-orm'
 import type { AppEnv, LotterySet } from '../types'
 import { MAX_SETS } from '../types'
 import { getDb, type DB } from '../db/client'
+import { chunk } from '../lib/chunk'
 import { setLotteries, sets } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson } from '../lib/http'
@@ -67,6 +68,15 @@ async function attachLotteries(db: DB, rows: SetRow[]): Promise<LotterySet[]> {
   }))
 }
 
+// set_lotteries has 3 columns, so 30 rows = 90 bound parameters, under D1's 100 limit. Multi-row
+// inserts also keep a full set (~80 lotteries) to 3 statements, under D1's 50 per request.
+const LINK_ROWS_PER_INSERT = 30
+
+function linkInserts(db: DB, setId: string, lotteryIds: string[]) {
+  const rows = lotteryIds.map((lotteryId, i) => ({ setId, lotteryId, sortOrder: i }))
+  return chunk(rows, LINK_ROWS_PER_INSERT).map((part) => db.insert(setLotteries).values(part))
+}
+
 async function ensureDefault(db: DB, memberId: string): Promise<void> {
   const existing = await db.query.sets.findFirst({
     where: and(eq(sets.memberId, memberId), eq(sets.isDefault, true)),
@@ -84,9 +94,7 @@ async function ensureDefault(db: DB, memberId: string): Promise<void> {
         isDefault: true,
         createdAt: nowIso(),
       }),
-      ...ids.map((lotteryId, i) =>
-        db.insert(setLotteries).values({ setId: id, lotteryId, sortOrder: i }),
-      ),
+      ...linkInserts(db, id, ids),
     ])
   } catch (e) {
     // A concurrent first GET /sets won the race (unique index sets_one_default_idx); the batch
@@ -145,9 +153,7 @@ setRoutes.patch('/sets/:id', async (c) => {
     const unknown = ids.filter((i) => !valid.has(i))
     if (unknown.length) throw errors.validation(`ไม่พบหวย: ${unknown.slice(0, 5).join(', ')}`)
     ops.push(db.delete(setLotteries).where(eq(setLotteries.setId, row.id)))
-    ids.forEach((lotteryId, i) =>
-      ops.push(db.insert(setLotteries).values({ setId: row.id, lotteryId, sortOrder: i })),
-    )
+    ops.push(...linkInserts(db, row.id, ids))
   }
   if (ops.length) await db.batch(ops as [(typeof ops)[number], ...(typeof ops)[number][]])
   const fresh = await ownedSet(db, memberId, row.id)

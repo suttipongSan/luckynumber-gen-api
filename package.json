@@ -5,15 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --port 8787",
-    "dev:db": "tsx scripts/dev-db-server.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx scripts/migrate.ts",
-    "seed": "tsx scripts/seed.ts",
+    "db:migrate": "wrangler d1 migrations apply numbergen --local",
+    "seed": "tsx scripts/seed-sql.ts --demo && wrangler d1 execute numbergen --local --file seed.sql",
     "hash-password": "tsx scripts/hash-password.ts",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "db:migrate:remote": "wrangler d1 migrations apply numbergen --remote",
+    "seed:remote": "tsx scripts/seed-sql.ts && wrangler d1 execute numbergen --remote --file seed.sql"
   },
   "dependencies": {
     "@libsql/client": "0.18.0",

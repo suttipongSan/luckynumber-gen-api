@@ -5,6 +5,7 @@ import { lotteries, renderCounters, type members } from '../db/schema'
 import type { AdminMember, Group, Lottery, Member } from '../types'
 import { RENDERS_PER_DAY } from '../types'
 import { isExpired, utcDay } from './time'
+import { chunk, IN_CHUNK } from './chunk'
 
 type MemberRow = typeof members.$inferSelect
 type LotteryRow = typeof lotteries.$inferSelect
@@ -59,20 +60,24 @@ export async function rendersTodayFor(db: DB, memberId: string): Promise<number>
 export async function rendersTodayMap(db: DB, memberIds: string[]): Promise<Map<string, number>> {
   const out = new Map<string, number>()
   if (memberIds.length === 0) return out
-  const rows = await db
-    .select()
-    .from(renderCounters)
-    .where(and(inArray(renderCounters.memberId, memberIds), eq(renderCounters.day, utcDay())))
-  for (const r of rows) out.set(r.memberId, r.count)
+  const day = utcDay()
+  for (const part of chunk(memberIds, IN_CHUNK)) {
+    const rows = await db
+      .select()
+      .from(renderCounters)
+      .where(and(inArray(renderCounters.memberId, part), eq(renderCounters.day, day)))
+    for (const r of rows) out.set(r.memberId, r.count)
+  }
   return out
 }
 
 /** Returns the subset of `ids` that exist in the lottery catalog. */
 export async function existingLotteryIds(db: DB, ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set()
-  const rows = await db
-    .select({ id: lotteries.id })
-    .from(lotteries)
-    .where(inArray(lotteries.id, ids))
-  return new Set(rows.map((r) => r.id))
+  const out = new Set<string>()
+  for (const part of chunk(ids, IN_CHUNK)) {
+    const rows = await db.select({ id: lotteries.id }).from(lotteries).where(inArray(lotteries.id, part))
+    for (const r of rows) out.add(r.id)
+  }
+  return out
 }

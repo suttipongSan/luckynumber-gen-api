@@ -1,3 +1,4 @@
+import type { AnyD1Database } from 'drizzle-orm/d1'
 // Shared API types. Mirrors API.md "Shared types" (and the web app's src/api/types.ts).
 
 export type Group = 'hanoi' | 'lao' | 'stock' | 'thai' | 'other'
@@ -140,7 +141,10 @@ export interface AssetBucket {
 }
 
 export interface Bindings {
-  TURSO_DATABASE_URL: string
+  /** Cloudflare D1 (production and `wrangler dev`). */
+  DB?: AnyD1Database
+  /** libSQL URL, used only when DB is absent (Node tests and scripts). */
+  TURSO_DATABASE_URL?: string
   TURSO_AUTH_TOKEN?: string
   SESSION_SECRET: string
   ASSET_SIGNING_SECRET: string
