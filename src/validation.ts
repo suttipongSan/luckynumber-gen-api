@@ -77,6 +77,36 @@ export const cardSettingsSchema = z
 
 export type CardSettingsInput = z.infer<typeof cardSettingsSchema>
 
+/** Whole body cap for `PUT /settings` (bulk). Per-item settings are each capped at 32 KB. */
+export const MAX_BULK_SETTINGS_BYTES = 1024 * 1024
+
+export const bulkSettingsSchema = z
+  .object({
+    items: z
+      .array(
+        z.object({
+          lotteryId: z.string().min(1).max(64),
+          settings: cardSettingsSchema,
+        }),
+      )
+      .min(1)
+      .max(100),
+  })
+  .superRefine((val, ctx) => {
+    const seen = new Set<string>()
+    const dups: string[] = []
+    for (const it of val.items) {
+      if (seen.has(it.lotteryId)) {
+        if (!dups.includes(it.lotteryId) && dups.length < 5) dups.push(it.lotteryId)
+      } else {
+        seen.add(it.lotteryId)
+      }
+    }
+    if (dups.length) {
+      ctx.addIssue({ code: 'custom', message: `lotteryId ซ้ำ: ${dups.join(', ')}` })
+    }
+  })
+
 export const passwordSchema = z.object({ password: z.string().min(8).max(200) })
 export const loginPasswordSchema = z.object({ password: z.string().min(1).max(200) })
 

@@ -485,6 +485,7 @@ const GATED: [string, string, unknown?][] = [
   ['PATCH', '/sets/someSetId000001', { name: 'y' }],
   ['DELETE', '/sets/someSetId000001'],
   ['GET', '/settings'],
+  ['PUT', '/settings', { items: [{ lotteryId: 'hanoi-regular', settings: {} }] }],
   ['GET', '/settings/hanoi-regular'],
   ['PUT', '/settings/hanoi-regular', {}],
   ['DELETE', '/settings/hanoi-regular'],
@@ -1038,5 +1039,387 @@ describe('review: member delete cascade', () => {
     expect(await db.query.renderCounters.findMany({ where: eq(renderCounters.memberId, m.id) })).toHaveLength(0)
     expect((await call('GET', '/me', m.cookie)).status).toBe(401)
     expect((await req(`/link/${m.token}`)).status).toBe(404)
+  })
+})
+
+describe('review: bulk PUT /settings', () => {
+  // The lottery catalog has 82 entries; add dummy rows so we can exercise the 100-item ceiling.
+  const EXTRA_COUNT = 30
+  const extraIds = Array.from({ length: EXTRA_COUNT }, (_, i) => `bulk-test-${i.toString().padStart(2, '0')}`)
+
+  beforeAll(async () => {
+    const db = getDb(env)
+    await db.insert(lotteries).values(
+      extraIds.map((id, i) => ({
+        id,
+        name: `Bulk Test ${i}`,
+        shortName: `B${i}`,
+        groupKey: 'other',
+        accent: '#000000',
+        sortOrder: 10_000 + i,
+        active: true,
+      })),
+    )
+  })
+
+  afterAll(async () => {
+    const db = getDb(env)
+    for (const id of extraIds) {
+      await db.delete(lotteries).where(eq(lotteries.id, id))
+    }
+  })
+
+  function bulkBody(pairs: { lotteryId: string; settings: Record<string, unknown> }[]) {
+    return { items: pairs }
+  }
+
+  it('applies settings to many lotteries and GET /settings reflects it', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-happy')
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones']
+    const items = ids.map((id, i) => ({
+      lotteryId: id,
+      settings: { fontFamily: 'Kanit', isDouble: i % 2 === 0, note: `n-${i}` },
+    }))
+    const res = await call('PUT', '/settings', m.cookie, bulkBody(items))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { settings: Record<string, { note?: string }> }
+    expect(Object.keys(body.settings).sort()).toEqual([...ids].sort())
+    expect(body.settings['hanoi-vip'].note).toBe('n-1')
+    const got = (await (await call('GET', '/settings', m.cookie)).json()) as Record<
+      string,
+      { note?: string; isDouble?: boolean }
+    >
+    for (const [i, id] of ids.entries()) {
+      expect(got[id]).toEqual({ fontFamily: 'Kanit', isDouble: i % 2 === 0, note: `n-${i}` })
+    }
+  })
+
+  it('overwrites existing rows', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-overwrite')
+    await call('PUT', '/settings/hanoi-regular', m.cookie, { fontFamily: 'Old', keep: 'nope' })
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody([{ lotteryId: 'hanoi-regular', settings: { fontFamily: 'New', after: true } }]),
+    )
+    expect(res.status).toBe(200)
+    const got = (await (await call('GET', '/settings/hanoi-regular', m.cookie)).json()) as Record<string, unknown>
+    expect(got).toEqual({ fontFamily: 'New', after: true })
+  })
+
+  it('accepts a full 100-item request', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-100')
+    const catalogIds = LOTTERY_CATALOG.slice(0, 70).map((l) => l.id)
+    const ids = [...catalogIds, ...extraIds]
+    expect(ids).toHaveLength(100)
+    const items = ids.map((id, i) => ({ lotteryId: id, settings: { idx: i } }))
+    const res = await call('PUT', '/settings', m.cookie, bulkBody(items))
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { settings: Record<string, { idx: number }> }
+    expect(Object.keys(body.settings)).toHaveLength(100)
+    const got = (await (await call('GET', '/settings', m.cookie)).json()) as Record<string, { idx: number }>
+    expect(Object.keys(got)).toHaveLength(100)
+    expect(got[ids[0]].idx).toBe(0)
+    expect(got[ids[99]].idx).toBe(99)
+  })
+
+  it('refuses 101 items with 400 VALIDATION', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-101')
+    const ids = Array.from({ length: 101 }, (_, i) => `bogus-${i}`)
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody(ids.map((id) => ({ lotteryId: id, settings: {} }))),
+    )
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+  })
+
+  it('refuses duplicate lottery ids with 400 VALIDATION', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-dup')
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody([
+        { lotteryId: 'hanoi-regular', settings: {} },
+        { lotteryId: 'hanoi-regular', settings: { fontFamily: 'Kanit' } },
+      ]),
+    )
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+    const db = getDb(env)
+    expect(
+      await db.query.cardSettings.findMany({ where: eq(cardSettings.memberId, m.id) }),
+    ).toHaveLength(0)
+  })
+
+  it('refuses unknown lottery ids with 400 and writes nothing', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-unknown')
+    const db = getDb(env)
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody([
+        { lotteryId: 'hanoi-regular', settings: { fontFamily: 'Kanit' } },
+        { lotteryId: 'no-such-lottery', settings: { fontFamily: 'Kanit' } },
+        { lotteryId: 'also-missing', settings: {} },
+      ]),
+    )
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('VALIDATION')
+    expect(body.error.message).toContain('no-such-lottery')
+    expect(body.error.message).toContain('also-missing')
+    expect(
+      await db.query.cardSettings.findMany({ where: eq(cardSettings.memberId, m.id) }),
+    ).toHaveLength(0)
+  })
+
+  it('caps the unknown-id list at 5 ids in the error message', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-unknown-cap')
+    const missing = Array.from({ length: 7 }, (_, i) => `missing-${i}`)
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody(missing.map((id) => ({ lotteryId: id, settings: {} }))),
+    )
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { message: string } }
+    const mentioned = missing.filter((id) => body.error.message.includes(id))
+    expect(mentioned.length).toBe(5)
+  })
+
+  it('unauthenticated → 401', async () => {
+    const res = await call(
+      'PUT',
+      '/settings',
+      undefined,
+      bulkBody([{ lotteryId: 'hanoi-regular', settings: {} }]),
+    )
+    expect(res.status).toBe(401)
+    expect(await res.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } })
+  })
+
+  it('expired member → 403 EXPIRED', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-expired')
+    await call('PATCH', `/admin/members/${m.id}`, admin, {
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    })
+    const res = await call(
+      'PUT',
+      '/settings',
+      m.cookie,
+      bulkBody([{ lotteryId: 'hanoi-regular', settings: {} }]),
+    )
+    expect(res.status).toBe(403)
+    expect(await res.json()).toMatchObject({ error: { code: 'EXPIRED' } })
+  })
+
+  it('rejects a body larger than 1 MB with 400 and writes nothing', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-oversize')
+    const db = getDb(env)
+    // ~30 KB of padding per item × 40 items ≈ 1.2 MB body, well over the 1 MB cap but
+    // each item.settings stays under the per-item 32 KB zod cap.
+    const pad = 'x'.repeat(30 * 1024)
+    const items = Array.from({ length: 40 }, (_, i) => ({
+      lotteryId: `bulk-test-${i.toString().padStart(2, '0')}`,
+      settings: { blob: pad },
+    }))
+    const res = await call('PUT', '/settings', m.cookie, bulkBody(items))
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('VALIDATION')
+    expect(body.error.message).toMatch(/KB/)
+    expect(
+      await db.query.cardSettings.findMany({ where: eq(cardSettings.memberId, m.id) }),
+    ).toHaveLength(0)
+  })
+
+  it('rejects an oversize body even when Content-Length is missing/lies', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-chunked')
+    const db = getDb(env)
+    const pad = 'x'.repeat(30 * 1024)
+    const items = Array.from({ length: 40 }, (_, i) => ({
+      lotteryId: `bulk-test-${i.toString().padStart(2, '0')}`,
+      settings: { blob: pad },
+    }))
+    const raw = JSON.stringify({ items })
+    // Stream the body so fetch / undici doesn't set an accurate Content-Length. The handler must
+    // still measure the actual UTF-8 bytes and reject.
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(raw))
+        controller.close()
+      },
+    })
+    const res = await app.request(
+      '/settings',
+      {
+        method: 'PUT',
+        headers: { Cookie: m.cookie, 'Content-Type': 'application/json' },
+        body: stream,
+        // @ts-expect-error duplex is required for a streaming body in modern fetch
+        duplex: 'half',
+      },
+      env,
+    )
+    expect(res.status).toBe(400)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    expect(body.error.code).toBe('VALIDATION')
+    expect(body.error.message).toMatch(/KB/)
+    expect(
+      await db.query.cardSettings.findMany({ where: eq(cardSettings.memberId, m.id) }),
+    ).toHaveLength(0)
+  })
+
+  it("never writes to another member's rows (member_id is taken from the session)", async () => {
+    const admin = await adminCookie()
+    const victim = await newMember(admin, 'bulk-victim')
+    const attacker = await newMember(admin, 'bulk-attacker')
+    // victim stores a known value
+    await call('PUT', '/settings/hanoi-regular', victim.cookie, {
+      fontFamily: 'Victim',
+      marker: 'victim-value',
+    })
+    // attacker writes the same lottery through the bulk endpoint
+    const res = await call(
+      'PUT',
+      '/settings',
+      attacker.cookie,
+      bulkBody([
+        {
+          lotteryId: 'hanoi-regular',
+          settings: { fontFamily: 'Attacker', marker: 'attacker-value' },
+        },
+      ]),
+    )
+    expect(res.status).toBe(200)
+    // victim's row is untouched
+    const victimGot = (await (
+      await call('GET', '/settings/hanoi-regular', victim.cookie)
+    ).json()) as Record<string, unknown>
+    expect(victimGot).toEqual({ fontFamily: 'Victim', marker: 'victim-value' })
+    // attacker got their own row
+    const attackerGot = (await (
+      await call('GET', '/settings/hanoi-regular', attacker.cookie)
+    ).json()) as Record<string, unknown>
+    expect(attackerGot).toEqual({ fontFamily: 'Attacker', marker: 'attacker-value' })
+    // And the DB has two separate rows, one per member.
+    const db = getDb(env)
+    const vRow = await db.query.cardSettings.findFirst({
+      where: and(eq(cardSettings.memberId, victim.id), eq(cardSettings.lotteryId, 'hanoi-regular')),
+    })
+    const aRow = await db.query.cardSettings.findFirst({
+      where: and(
+        eq(cardSettings.memberId, attacker.id),
+        eq(cardSettings.lotteryId, 'hanoi-regular'),
+      ),
+    })
+    expect(JSON.parse(vRow!.settingsJson)).toMatchObject({ marker: 'victim-value' })
+    expect(JSON.parse(aRow!.settingsJson)).toMatchObject({ marker: 'attacker-value' })
+  })
+
+  it('route does not shadow GET /settings or PUT /settings/:lotteryId', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bulk-noshadow')
+    // single PUT still works after a bulk PUT
+    expect(
+      (
+        await call(
+          'PUT',
+          '/settings',
+          m.cookie,
+          bulkBody([{ lotteryId: 'hanoi-regular', settings: { via: 'bulk' } }]),
+        )
+      ).status,
+    ).toBe(200)
+    expect(
+      (await call('PUT', '/settings/hanoi-vip', m.cookie, { via: 'single' })).status,
+    ).toBe(200)
+    // GET /settings returns both
+    const list = (await (await call('GET', '/settings', m.cookie)).json()) as Record<
+      string,
+      { via: string }
+    >
+    expect(list['hanoi-regular']).toEqual({ via: 'bulk' })
+    expect(list['hanoi-vip']).toEqual({ via: 'single' })
+    // GET /settings/:lotteryId still responds for a single lottery
+    expect(
+      await (await call('GET', '/settings/hanoi-regular', m.cookie)).json(),
+    ).toEqual({ via: 'bulk' })
+    // DELETE /settings/:lotteryId still works too
+    expect((await call('DELETE', '/settings/hanoi-vip', m.cookie)).status).toBe(204)
+    expect((await call('GET', '/settings/hanoi-vip', m.cookie)).status).toBe(404)
+  })
+})
+
+describe('unit: chunkSettingsRows', () => {
+  it('keeps every chunk ≤ 20 rows AND ≤ 90 KB of settings JSON', async () => {
+    const { chunkSettingsRows, SETTINGS_MAX_ROWS_PER_INSERT, SETTINGS_MAX_BYTES_PER_INSERT } =
+      await import('../src/routes/settings')
+    const enc = new TextEncoder()
+
+    const check = (rows: { memberId: string; lotteryId: string; settingsJson: string; updatedAt: string }[]) => {
+      const chunks = chunkSettingsRows(rows)
+      // Reconstructed rows match the input in order
+      expect(chunks.flat()).toEqual(rows)
+      for (const part of chunks) {
+        expect(part.length).toBeLessThanOrEqual(SETTINGS_MAX_ROWS_PER_INSERT)
+        let bytes = 0
+        for (const r of part) bytes += enc.encode(r.settingsJson).length
+        // A single oversized row still becomes its own chunk, but all realistic inputs here fit.
+        if (part.length > 1) expect(bytes).toBeLessThanOrEqual(SETTINGS_MAX_BYTES_PER_INSERT)
+      }
+      return chunks
+    }
+
+    const mkRow = (i: number, size: number) => ({
+      memberId: 'm',
+      lotteryId: `l-${i}`,
+      settingsJson: JSON.stringify({ pad: 'a'.repeat(Math.max(size - 20, 1)) }),
+      updatedAt: '2026-11-07T00:00:00.000Z',
+    })
+
+    // Many tiny rows → split by the 20-row cap only.
+    const tiny = Array.from({ length: 100 }, (_, i) => mkRow(i, 50))
+    const tinyChunks = check(tiny)
+    expect(tinyChunks).toHaveLength(5)
+    for (const c of tinyChunks) expect(c.length).toBe(20)
+
+    // Rows large enough that the JSON-size cap bites first.
+    const big = Array.from({ length: 30 }, (_, i) => mkRow(i, 20 * 1024))
+    const bigChunks = check(big)
+    for (const c of bigChunks) {
+      let bytes = 0
+      for (const r of c) bytes += enc.encode(r.settingsJson).length
+      expect(bytes).toBeLessThanOrEqual(SETTINGS_MAX_BYTES_PER_INSERT)
+    }
+    expect(bigChunks.length).toBeGreaterThan(2)
+
+    // Mixed sizes preserve order and respect both caps.
+    const mixed = [
+      mkRow(0, 60 * 1024),
+      ...Array.from({ length: 25 }, (_, i) => mkRow(i + 1, 1 * 1024)),
+      mkRow(99, 80 * 1024),
+    ]
+    check(mixed)
+
+    // Empty input → no chunks.
+    expect(chunkSettingsRows([])).toEqual([])
   })
 })

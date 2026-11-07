@@ -51,3 +51,35 @@ export async function parseJson<T extends z.ZodType>(c: Context, schema: T): Pro
   }
   return parseWith(schema, raw)
 }
+
+/**
+ * Like {@link parseJson} but rejects a body larger than `maxBytes` with 400 VALIDATION.
+ * Checks the declared `Content-Length` first, then the actual UTF-8 byte length of the read body.
+ */
+export async function parseJsonLimited<T extends z.ZodType>(
+  c: Context,
+  schema: T,
+  maxBytes: number,
+): Promise<z.infer<T>> {
+  const declared = Number(c.req.header('Content-Length') ?? '0')
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw errors.validation(`ขนาดข้อมูลเกิน ${Math.round(maxBytes / 1024)} KB`)
+  }
+  let text: string
+  try {
+    text = await c.req.text()
+  } catch {
+    throw errors.validation('ต้องส่งข้อมูลเป็น JSON')
+  }
+  const bytes = new TextEncoder().encode(text).length
+  if (bytes > maxBytes) {
+    throw errors.validation(`ขนาดข้อมูลเกิน ${Math.round(maxBytes / 1024)} KB`)
+  }
+  let raw: unknown
+  try {
+    raw = JSON.parse(text)
+  } catch {
+    throw errors.validation('ต้องส่งข้อมูลเป็น JSON')
+  }
+  return parseWith(schema, raw)
+}
