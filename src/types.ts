@@ -12,6 +12,8 @@ export interface Lottery {
   accent: string
   sortOrder: number
   active: boolean
+  /** True when owned by the requesting member (F5). Admin responses always omit it / false. */
+  custom: boolean
 }
 
 /** The member as seen by the member (`GET /me`). */
@@ -39,9 +41,11 @@ export interface LotterySet {
   name: string
   isDefault: boolean
   lotteryIds: string[]
+  /** F4: parallel to lotteryIds (same length, same order), each 1..20. */
+  rounds: number[]
 }
 
-export type AssetKind = 'background' | 'logo'
+export type AssetKind = 'background' | 'logo' | 'qr'
 
 export interface Asset {
   id: string
@@ -96,6 +100,7 @@ export interface CardSettings {
   }
   backgroundAssetId?: string | null
   logo?: { assetId: string | null; x: number; y: number; width: number; opacity: number }
+  qr?: { assetId: string | null; x: number; y: number; width: number; opacity: number }
   [key: string]: unknown
 }
 
@@ -181,6 +186,9 @@ export const RENDERS_PER_DAY = 600
 export const MAX_ITEMS_PER_RENDER = 80
 export const MAX_SETS = 30
 export const MAX_ASSETS = 20
+export const MAX_CUSTOM_LOTTERIES = 30
+export const MIN_ROUND = 1
+export const MAX_ROUND = 20
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024
 export const ASSET_URL_TTL_SECONDS = 600
 export const SESSION_TTL_SECONDS = 24 * 60 * 60

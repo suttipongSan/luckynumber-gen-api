@@ -35,15 +35,21 @@ export const adminSessions = sqliteTable('admin_sessions', {
   expiresAt: text('expires_at').notNull(),
 })
 
-export const lotteries = sqliteTable('lotteries', {
-  id: text('id').primaryKey(),
-  name: text('name').notNull(),
-  shortName: text('short_name').notNull(),
-  groupKey: text('group_key').notNull(),
-  accent: text('accent').notNull(),
-  sortOrder: integer('sort_order').notNull().default(0),
-  active: integer('active', { mode: 'boolean' }).notNull().default(true),
-})
+export const lotteries = sqliteTable(
+  'lotteries',
+  {
+    id: text('id').primaryKey(),
+    name: text('name').notNull(),
+    shortName: text('short_name').notNull(),
+    groupKey: text('group_key').notNull(),
+    accent: text('accent').notNull(),
+    sortOrder: integer('sort_order').notNull().default(0),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    /** NULL = global catalog (admin-managed). Otherwise private to that member. */
+    ownerMemberId: text('owner_member_id'),
+  },
+  (t) => [index('lotteries_owner_idx').on(t.ownerMemberId)],
+)
 
 export const sets = sqliteTable(
   'sets',
@@ -73,6 +79,8 @@ export const setLotteries = sqliteTable(
       .notNull()
       .references(() => lotteries.id, { onDelete: 'cascade' }),
     sortOrder: integer('sort_order').notNull().default(0),
+    /** F4 รอบ: 1..20. Set via PATCH /sets/:id { rounds }. */
+    round: integer('round').notNull().default(1),
   },
   (t) => [primaryKey({ columns: [t.setId, t.lotteryId] })],
 )
@@ -99,7 +107,7 @@ export const assets = sqliteTable(
     memberId: text('member_id')
       .notNull()
       .references(() => members.id, { onDelete: 'cascade' }),
-    kind: text('kind', { enum: ['background', 'logo'] }).notNull(),
+    kind: text('kind', { enum: ['background', 'logo', 'qr'] }).notNull(),
     fileName: text('file_name').notNull(),
     contentType: text('content_type').notNull(),
     sizeBytes: integer('size_bytes').notNull(),

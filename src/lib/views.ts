@@ -1,5 +1,5 @@
 // Row → API shape mappers and small shared queries.
-import { and, eq, inArray } from 'drizzle-orm'
+import { and, eq, inArray, isNull, or } from 'drizzle-orm'
 import type { DB } from '../db/client'
 import { lotteries, renderCounters, type members } from '../db/schema'
 import type { AdminMember, Group, Lottery, Member } from '../types'
@@ -10,7 +10,12 @@ import { chunk, IN_CHUNK } from './chunk'
 type MemberRow = typeof members.$inferSelect
 type LotteryRow = typeof lotteries.$inferSelect
 
-export function toLottery(r: LotteryRow): Lottery {
+/**
+ * Maps a lottery row to the API shape. Pass the requesting `memberId` to set `custom: true`
+ * when the lottery is owned by that member. Admin / public callers omit the id and get
+ * `custom: false`.
+ */
+export function toLottery(r: LotteryRow, memberId?: string): Lottery {
   return {
     id: r.id,
     name: r.name,
@@ -19,6 +24,7 @@ export function toLottery(r: LotteryRow): Lottery {
     accent: r.accent,
     sortOrder: r.sortOrder,
     active: r.active,
+    custom: memberId !== undefined && r.ownerMemberId === memberId,
   }
 }
 
@@ -71,12 +77,28 @@ export async function rendersTodayMap(db: DB, memberIds: string[]): Promise<Map<
   return out
 }
 
-/** Returns the subset of `ids` that exist in the lottery catalog. */
-export async function existingLotteryIds(db: DB, ids: string[]): Promise<Set<string>> {
+/**
+ * Returns the subset of `ids` that this member may reference: global lotteries
+ * (`owner_member_id IS NULL`) and the member's own custom ones. Another member's custom id
+ * behaves like an unknown id. Used by sets.ts, settings.ts (single + bulk) and render.ts.
+ */
+export async function memberLotteryIds(
+  db: DB,
+  memberId: string,
+  ids: string[],
+): Promise<Set<string>> {
   if (ids.length === 0) return new Set()
   const out = new Set<string>()
   for (const part of chunk(ids, IN_CHUNK)) {
-    const rows = await db.select({ id: lotteries.id }).from(lotteries).where(inArray(lotteries.id, part))
+    const rows = await db
+      .select({ id: lotteries.id })
+      .from(lotteries)
+      .where(
+        and(
+          inArray(lotteries.id, part),
+          or(isNull(lotteries.ownerMemberId), eq(lotteries.ownerMemberId, memberId)),
+        ),
+      )
     for (const r of rows) out.add(r.id)
   }
   return out

@@ -2,7 +2,7 @@
 // bounds from API.md are enforced (rows 0..6, perRow 1..6, fontSize 8..400, colours ≤ 40 chars,
 // whole document ≤ 32 KB).
 import { z } from 'zod'
-import { GROUPS } from './types'
+import { GROUPS, MAX_ROUND, MIN_ROUND } from './types'
 
 export const MAX_SETTINGS_BYTES = 32 * 1024
 
@@ -67,6 +67,15 @@ export const cardSettingsSchema = z
         opacity: num.min(0).max(1),
       })
       .optional(),
+    qr: z
+      .looseObject({
+        assetId: assetIdRef,
+        x: num,
+        y: num,
+        width: num.min(0),
+        opacity: num.min(0).max(1),
+      })
+      .optional(),
   })
   .superRefine((val, ctx) => {
     const bytes = new TextEncoder().encode(JSON.stringify(val)).length
@@ -111,10 +120,35 @@ export const passwordSchema = z.object({ password: z.string().min(8).max(200) })
 export const loginPasswordSchema = z.object({ password: z.string().min(1).max(200) })
 
 export const setNameSchema = z.object({ name: z.string().trim().min(1).max(40) })
-export const patchSetSchema = z.object({
-  name: z.string().trim().min(1).max(40).optional(),
-  lotteryIds: z.array(z.string().min(1).max(64)).max(500).optional(),
-})
+
+const roundValue = z.number().int().min(MIN_ROUND).max(MAX_ROUND)
+
+export const patchSetSchema = z
+  .object({
+    name: z.string().trim().min(1).max(40).optional(),
+    lotteryIds: z.array(z.string().min(1).max(64)).max(500).optional(),
+    rounds: z.array(roundValue).max(500).optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.rounds !== undefined && val.lotteryIds === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['rounds'],
+        message: 'rounds ต้องส่งคู่กับ lotteryIds',
+      })
+    }
+    if (
+      val.rounds !== undefined &&
+      val.lotteryIds !== undefined &&
+      val.rounds.length !== val.lotteryIds.length
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['rounds'],
+        message: 'จำนวน rounds ต้องเท่ากับ lotteryIds',
+      })
+    }
+  })
 
 const fixedSlot = z.union([z.string().max(2), z.null()])
 
@@ -162,6 +196,17 @@ export const lotterySchema = z.object({
   active: z.boolean(),
 })
 export const patchLotterySchema = lotterySchema.partial()
+
+/**
+ * F5 member-created lottery. `name` 1..40, `shortName?` 1..20 (defaults to name without spaces,
+ * capped at 20), `group` is one of the catalog groups.
+ */
+export const memberLotterySchema = z.object({
+  name: z.string().trim().min(1).max(40),
+  shortName: z.string().trim().min(1).max(20).optional(),
+  group: z.enum(GROUPS),
+})
+export const patchMemberLotterySchema = memberLotterySchema.partial()
 
 export const newsSchema = z.object({
   title: z.string().trim().min(1).max(200),

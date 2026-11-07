@@ -1,6 +1,6 @@
 // Per-lottery CardSettings, stored server-side as JSON.
 import { Hono } from 'hono'
-import { and, eq, sql } from 'drizzle-orm'
+import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import type { AppEnv, CardSettings } from '../types'
 import { getDb } from '../db/client'
 import { cardSettings, lotteries } from '../db/schema'
@@ -8,7 +8,7 @@ import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson, parseJsonLimited } from '../lib/http'
 import { nowIso } from '../lib/time'
 import { bulkSettingsSchema, cardSettingsSchema, MAX_BULK_SETTINGS_BYTES } from '../validation'
-import { existingLotteryIds } from '../lib/views'
+import { memberLotteryIds } from '../lib/views'
 
 export const settingsRoutes = new Hono<AppEnv>()
 settingsRoutes.use('/settings', requireMember())
@@ -77,7 +77,7 @@ settingsRoutes.put('/settings', async (c) => {
   const memberId = c.get('member').id
   const body = await parseJsonLimited(c, bulkSettingsSchema, MAX_BULK_SETTINGS_BYTES)
   const ids = body.items.map((it) => it.lotteryId)
-  const valid = await existingLotteryIds(db, ids)
+  const valid = await memberLotteryIds(db, memberId, ids)
   const unknown = ids.filter((i) => !valid.has(i))
   if (unknown.length) {
     throw errors.validation(`ไม่พบหวย: ${unknown.slice(0, 5).join(', ')}`)
@@ -123,15 +123,21 @@ settingsRoutes.get('/settings/:lotteryId', async (c) => {
 
 settingsRoutes.put('/settings/:lotteryId', async (c) => {
   const db = getDb(c.env)
+  const memberId = c.get('member').id
   const lotteryId = c.req.param('lotteryId')
   const body = await parseJson(c, cardSettingsSchema)
-  const lottery = await db.query.lotteries.findFirst({ where: eq(lotteries.id, lotteryId) })
+  const lottery = await db.query.lotteries.findFirst({
+    where: and(
+      eq(lotteries.id, lotteryId),
+      or(isNull(lotteries.ownerMemberId), eq(lotteries.ownerMemberId, memberId)),
+    ),
+  })
   if (!lottery) throw errors.notFound('ไม่พบหวย')
   const json = JSON.stringify(body)
   const updatedAt = nowIso()
   await db
     .insert(cardSettings)
-    .values({ memberId: c.get('member').id, lotteryId, settingsJson: json, updatedAt })
+    .values({ memberId, lotteryId, settingsJson: json, updatedAt })
     .onConflictDoUpdate({
       target: [cardSettings.memberId, cardSettings.lotteryId],
       set: { settingsJson: json, updatedAt },

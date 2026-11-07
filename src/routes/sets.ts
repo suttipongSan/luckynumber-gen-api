@@ -11,7 +11,7 @@ import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson } from '../lib/http'
 import { newId } from '../lib/ids'
 import { nowIso } from '../lib/time'
-import { existingLotteryIds } from '../lib/views'
+import { memberLotteryIds } from '../lib/views'
 import { patchSetSchema, setNameSchema } from '../validation'
 
 export const DEFAULT_SET_NAME = 'Default'
@@ -52,29 +52,44 @@ async function attachLotteries(db: DB, rows: SetRow[]): Promise<LotterySet[]> {
       ),
     )
     .orderBy(asc(setLotteries.sortOrder))
-  const bySet = new Map<string, string[]>()
+  const bySet = new Map<string, { lotteryIds: string[]; rounds: number[] }>()
   for (const l of links) {
-    const list = bySet.get(l.setId) ?? []
-    list.push(l.lotteryId)
-    bySet.set(l.setId, list)
+    const entry = bySet.get(l.setId) ?? { lotteryIds: [], rounds: [] }
+    entry.lotteryIds.push(l.lotteryId)
+    entry.rounds.push(l.round)
+    bySet.set(l.setId, entry)
   }
   // Default first, then creation order.
   const sorted = [...rows].sort((a, b) => Number(b.isDefault) - Number(a.isDefault))
-  return sorted.map((r) => ({
-    id: r.id,
-    name: r.name,
-    isDefault: r.isDefault,
-    lotteryIds: bySet.get(r.id) ?? [],
-  }))
+  return sorted.map((r) => {
+    const entry = bySet.get(r.id)
+    return {
+      id: r.id,
+      name: r.name,
+      isDefault: r.isDefault,
+      lotteryIds: entry?.lotteryIds ?? [],
+      rounds: entry?.rounds ?? [],
+    }
+  })
 }
 
-// set_lotteries has 3 columns, so 30 rows = 90 bound parameters, under D1's 100 limit. Multi-row
-// inserts also keep a full set (~80 lotteries) to 3 statements, under D1's 50 per request.
-const LINK_ROWS_PER_INSERT = 30
+// F4: set_lotteries now has 4 columns. 25 rows × 4 params = 100 bound parameters, D1's hard
+// per-statement cap. A full set (~80 lotteries) still fits in ≤ 4 statements per batch.
+const LINK_ROWS_PER_INSERT = 25
 
-function linkInserts(db: DB, setId: string, lotteryIds: string[]) {
-  const rows = lotteryIds.map((lotteryId, i) => ({ setId, lotteryId, sortOrder: i }))
-  return chunk(rows, LINK_ROWS_PER_INSERT).map((part) => db.insert(setLotteries).values(part))
+function linkInserts(
+  db: DB,
+  setId: string,
+  lotteryIds: string[],
+  rounds: number[],
+) {
+  const values = lotteryIds.map((lotteryId, i) => ({
+    setId,
+    lotteryId,
+    sortOrder: i,
+    round: rounds[i] ?? 1,
+  }))
+  return chunk(values, LINK_ROWS_PER_INSERT).map((part) => db.insert(setLotteries).values(part))
 }
 
 async function ensureDefault(db: DB, memberId: string): Promise<void> {
@@ -83,8 +98,9 @@ async function ensureDefault(db: DB, memberId: string): Promise<void> {
   })
   if (existing) return
   const id = newId()
-  const valid = await existingLotteryIds(db, DEFAULT_SET_LOTTERIES)
+  const valid = await memberLotteryIds(db, memberId, DEFAULT_SET_LOTTERIES)
   const ids = DEFAULT_SET_LOTTERIES.filter((l) => valid.has(l))
+  const rounds = ids.map(() => 1)
   try {
     await db.batch([
       db.insert(sets).values({
@@ -94,7 +110,7 @@ async function ensureDefault(db: DB, memberId: string): Promise<void> {
         isDefault: true,
         createdAt: nowIso(),
       }),
-      ...linkInserts(db, id, ids),
+      ...linkInserts(db, id, ids, rounds),
     ])
   } catch (e) {
     // A concurrent first GET /sets won the race (unique index sets_one_default_idx); the batch
@@ -131,7 +147,7 @@ setRoutes.post('/sets', async (c) => {
   if (count >= MAX_SETS) throw errors.conflict('QUOTA', `สร้างชุดได้สูงสุด ${MAX_SETS} ชุด`)
   const row: SetRow = { id: newId(), memberId, name, isDefault: false, createdAt: nowIso() }
   await db.insert(sets).values(row)
-  const out: LotterySet = { id: row.id, name: row.name, isDefault: false, lotteryIds: [] }
+  const out: LotterySet = { id: row.id, name: row.name, isDefault: false, lotteryIds: [], rounds: [] }
   return c.json(out)
 })
 
@@ -148,12 +164,31 @@ setRoutes.patch('/sets/:id', async (c) => {
     ops.push(db.update(sets).set({ name: body.name }).where(eq(sets.id, row.id)))
   }
   if (body.lotteryIds !== undefined) {
-    const ids = Array.from(new Set(body.lotteryIds))
-    const valid = await existingLotteryIds(db, ids)
+    // De-duplicate but keep first occurrence's position, and mirror the rounds array alongside.
+    const seen = new Set<string>()
+    const ids: string[] = []
+    const rounds: number[] = []
+    for (let i = 0; i < body.lotteryIds.length; i++) {
+      const id = body.lotteryIds[i]
+      if (seen.has(id)) continue
+      seen.add(id)
+      ids.push(id)
+      rounds.push(body.rounds?.[i] ?? NaN)
+    }
+    const valid = await memberLotteryIds(db, memberId, ids)
     const unknown = ids.filter((i) => !valid.has(i))
     if (unknown.length) throw errors.validation(`ไม่พบหวย: ${unknown.slice(0, 5).join(', ')}`)
+    // If rounds not provided, keep the existing round for lotteries already in the set (else 1).
+    if (body.rounds === undefined) {
+      const current = await db
+        .select({ lotteryId: setLotteries.lotteryId, round: setLotteries.round })
+        .from(setLotteries)
+        .where(eq(setLotteries.setId, row.id))
+      const prev = new Map(current.map((r) => [r.lotteryId, r.round]))
+      for (let i = 0; i < ids.length; i++) rounds[i] = prev.get(ids[i]) ?? 1
+    }
     ops.push(db.delete(setLotteries).where(eq(setLotteries.setId, row.id)))
-    ops.push(...linkInserts(db, row.id, ids))
+    ops.push(...linkInserts(db, row.id, ids, rounds))
   }
   if (ops.length) await db.batch(ops as [(typeof ops)[number], ...(typeof ops)[number][]])
   const fresh = await ownedSet(db, memberId, row.id)

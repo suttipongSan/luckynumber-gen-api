@@ -1,6 +1,6 @@
 // Back office API (operator). Cookie `ng_admin`; everything except login/logout requires it.
 import { Hono } from 'hono'
-import { asc, desc, eq, inArray, like, or } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNull, like, or } from 'drizzle-orm'
 import type { AdminNews, AppEnv } from '../types'
 import { getDb, type DB } from '../db/client'
 import {
@@ -158,14 +158,23 @@ adminRoutes.delete('/members/:id', async (c) => {
     }
   }
   const setIds = db.select({ id: sets.id }).from(sets).where(eq(sets.memberId, id))
+  // F5: also drop this member's custom lotteries and the set_lotteries / card_settings rows that
+  // reference them (across all members, defence in depth — only this member can create them).
+  const customLotteryIds = db
+    .select({ id: lotteries.id })
+    .from(lotteries)
+    .where(eq(lotteries.ownerMemberId, id))
   await db.batch([
     db.delete(setLotteries).where(inArray(setLotteries.setId, setIds)),
+    db.delete(setLotteries).where(inArray(setLotteries.lotteryId, customLotteryIds)),
+    db.delete(cardSettings).where(inArray(cardSettings.lotteryId, customLotteryIds)),
     db.delete(sets).where(eq(sets.memberId, id)),
     db.delete(cardSettings).where(eq(cardSettings.memberId, id)),
     db.delete(assets).where(eq(assets.memberId, id)),
     db.delete(newsReads).where(eq(newsReads.memberId, id)),
     db.delete(renderCounters).where(eq(renderCounters.memberId, id)),
     db.delete(memberSessions).where(eq(memberSessions.memberId, id)),
+    db.delete(lotteries).where(eq(lotteries.ownerMemberId, id)),
     db.delete(members).where(eq(members.id, id)),
   ])
   await clearFailures(db, linkKey(row.linkToken))
@@ -174,12 +183,15 @@ adminRoutes.delete('/members/:id', async (c) => {
 
 // ---- lotteries
 
+// Admin only ever manages the global catalog (owner_member_id IS NULL). Member-created custom
+// lotteries live on the same table but are invisible here.
 adminRoutes.get('/lotteries', async (c) => {
   const rows = await getDb(c.env)
     .select()
     .from(lotteries)
+    .where(isNull(lotteries.ownerMemberId))
     .orderBy(asc(lotteries.sortOrder), asc(lotteries.name))
-  return c.json(rows.map(toLottery))
+  return c.json(rows.map((r) => toLottery(r)))
 })
 
 adminRoutes.post('/lotteries', async (c) => {
@@ -193,6 +205,7 @@ adminRoutes.post('/lotteries', async (c) => {
     accent: body.accent,
     sortOrder: body.sortOrder,
     active: body.active,
+    ownerMemberId: null,
   }
   await db.insert(lotteries).values(row)
   return c.json(toLottery(row))
@@ -210,9 +223,14 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
   if (body.sortOrder !== undefined) patch.sortOrder = body.sortOrder
   if (body.active !== undefined) patch.active = body.active
   if (Object.keys(patch).length) {
-    await db.update(lotteries).set(patch).where(eq(lotteries.id, id))
+    await db
+      .update(lotteries)
+      .set(patch)
+      .where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)))
   }
-  const row = await db.query.lotteries.findFirst({ where: eq(lotteries.id, id) })
+  const row = await db.query.lotteries.findFirst({
+    where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
+  })
   if (!row) throw errors.notFound('ไม่พบหวย')
   return c.json(toLottery(row))
 })
@@ -220,12 +238,14 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
 adminRoutes.delete('/lotteries/:id', async (c) => {
   const db = getDb(c.env)
   const id = c.req.param('id')
-  const row = await db.query.lotteries.findFirst({ where: eq(lotteries.id, id) })
+  const row = await db.query.lotteries.findFirst({
+    where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
+  })
   if (!row) throw errors.notFound('ไม่พบหวย')
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.lotteryId, id)),
     db.delete(cardSettings).where(eq(cardSettings.lotteryId, id)),
-    db.delete(lotteries).where(eq(lotteries.id, id)),
+    db.delete(lotteries).where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId))),
   ])
   return c.body(null, 204)
 })

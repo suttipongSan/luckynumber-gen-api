@@ -109,7 +109,28 @@ multi-row inserts.
   day (`render_counters`). The counter is incremented atomically first and rolled back when it goes over the limit.
 - **CSRF**: on top of CORS, any non-GET request that carries an `Origin` header outside the allow-list is
   rejected with 403. Multipart uploads are "simple" requests and skip the CORS preflight, which is why this check exists.
-- **Assets**: png, jpg, webp, gif and avif up to 5 MB, 20 per member. SVG is refused. Deleting an asset clears
-  `backgroundAssetId` / `logo.assetId` in that member's saved settings.
+- **Assets**: png, jpg, webp, gif and avif up to 5 MB, 20 per member. SVG is refused. Kinds are
+  `background`, `logo` and `qr` (v2); deleting an asset clears `backgroundAssetId`, `logo.assetId`
+  and `qr.assetId` in that member's saved settings.
 - **Member delete** removes the member's sets, settings, assets (DB rows and R2 objects), news reads,
-  render counters and sessions.
+  render counters, sessions and v2 custom lotteries (and the set_lotteries / card_settings rows for them).
+
+## v2 additions (2026-11-07)
+
+Five member-review requests (see `../numbergen/API.md` "v2 additions" for the contract).
+
+- **F2 QR code image**: `POST /assets` accepts `kind=qr` (shares the 20-file quota); `CardSettings.qr`
+  is validated the same way as `logo`; `POST /render/numbers` signs `qr.assetId`; `DELETE /assets/:id`
+  clears it.
+- **F4 rounds**: `set_lotteries.round INTEGER NOT NULL DEFAULT 1` (1..20); `LotterySet.rounds`
+  parallels `lotteryIds`; `PATCH /sets/:id { rounds? }` must be sent together with `lotteryIds` and
+  match its length. `set_lotteries` inserts are chunked at 25 rows (4 params each → 100 bound params).
+- **F5 member-created lotteries**: `lotteries.owner_member_id TEXT NULL` (+ index). `GET /lotteries`
+  returns active global lotteries plus every lottery owned by the caller, sorted by `GROUP_ORDER` then
+  `sortOrder`. `POST /lotteries { name, shortName?, group }` creates one (id `m-<16>`, accent from the
+  group palette, sortOrder 10000+, 30-per-member quota → 409 `QUOTA`); `PATCH /lotteries/:id` and
+  `DELETE /lotteries/:id` operate on own lotteries only (delete cascades `set_lotteries` and
+  `card_settings`). Every member-side lottery lookup (sets, single and bulk settings, render) accepts
+  only global ids or the member's own via `memberLotteryIds`; another member's custom id behaves like
+  an unknown id. `/admin/lotteries` lists and edits global lotteries only; admin member delete also
+  drops that member's custom lotteries and their references.

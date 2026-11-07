@@ -6,12 +6,13 @@ import type { AppEnv, CardNumbers, CardSettings } from '../types'
 import { ASSET_URL_TTL_SECONDS, RENDERS_PER_DAY } from '../types'
 import { getDb } from '../db/client'
 import { chunk, IN_CHUNK } from '../lib/chunk'
-import { assets, cardSettings, lotteries, members, renderCounters } from '../db/schema'
+import { assets, cardSettings, members, renderCounters } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson } from '../lib/http'
 import { generateForSettings } from '../lib/numbers'
 import { signedAssetUrl } from '../lib/crypto'
 import { utcDay } from '../lib/time'
+import { memberLotteryIds } from '../lib/views'
 import { renderSchema } from '../validation'
 import { parseSettingsJson } from './settings'
 
@@ -28,10 +29,10 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   const body = await parseJson(c, renderSchema)
   const n = body.items.length
 
-  // Lotteries must exist (inactive ones are still allowed so saved sets keep working).
+  // Lotteries must exist and belong to this member (global catalog OR owned by them).
+  // Inactive ones are still allowed so saved sets keep working.
   const ids = Array.from(new Set(body.items.map((i) => i.lotteryId)))
-  const found = await db.select({ id: lotteries.id }).from(lotteries).where(inArray(lotteries.id, ids))
-  const known = new Set(found.map((r) => r.id))
+  const known = await memberLotteryIds(db, member.id, ids)
   const missing = ids.filter((i) => !known.has(i))
   if (missing.length) throw errors.notFound(`ไม่พบหวย: ${missing.slice(0, 5).join(', ')}`)
 
@@ -73,6 +74,7 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
     const settings = (item.settings as CardSettings | undefined) ?? saved.get(item.lotteryId) ?? null
     if (settings?.backgroundAssetId) assetRefs.add(settings.backgroundAssetId)
     if (settings?.logo?.assetId) assetRefs.add(settings.logo.assetId)
+    if (settings?.qr?.assetId) assetRefs.add(settings.qr.assetId)
     return { lotteryId: item.lotteryId, numbers: generateForSettings(settings, item.fixed) }
   })
 

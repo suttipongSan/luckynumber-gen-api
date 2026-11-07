@@ -2,7 +2,7 @@
 // `npm run seed` and the tests. Accent colours follow the mockup's per-group palette.
 import type { Group, Lottery } from '../types'
 
-const GROUP_PALETTE: Record<Group, string[]> = {
+export const GROUP_PALETTE: Record<Group, string[]> = {
   thai: ['#b91c1c', '#991b1b', '#7f1d1d', '#9f1239', '#a21217'],
   hanoi: ['#be123c', '#9d174d', '#831843', '#7f1d1d', '#9f1239'],
   lao: ['#065f46', '#047857', '#166534', '#15803d', '#14532d'],
@@ -131,5 +131,6 @@ export const LOTTERY_CATALOG: Lottery[] = GROUP_ORDER.flatMap((group) =>
     accent: palette[groupIndex % palette.length],
     sortOrder: (i + 1) * 10,
     active: true,
+    custom: false,
   }
 })

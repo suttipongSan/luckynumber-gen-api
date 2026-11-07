@@ -59,6 +59,10 @@ export async function clearAssetRefs(db: DB, memberId: string, assetId: string):
       s.logo = { ...s.logo, assetId: null }
       changed = true
     }
+    if (s.qr && s.qr.assetId === assetId) {
+      s.qr = { ...s.qr, assetId: null }
+      changed = true
+    }
     if (changed) {
       await db
         .update(cardSettings)
@@ -134,8 +138,8 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
   }
   const file = form['file']
   const kind = form['kind']
-  if (kind !== 'background' && kind !== 'logo') {
-    throw errors.validation("kind ต้องเป็น 'background' หรือ 'logo'")
+  if (kind !== 'background' && kind !== 'logo' && kind !== 'qr') {
+    throw errors.validation("kind ต้องเป็น 'background', 'logo' หรือ 'qr'")
   }
   if (!(file instanceof File)) throw errors.validation('ไม่พบไฟล์ (file)')
   const contentType = (file.type || '').toLowerCase()

@@ -1423,3 +1423,597 @@ describe('unit: chunkSettingsRows', () => {
     expect(chunkSettingsRows([])).toEqual([])
   })
 })
+
+// ---------------------------------------------------------------------------------------------
+// v2 additions (2026-11-07): F2 QR, F4 rounds, F5 member-created lotteries.
+// ---------------------------------------------------------------------------------------------
+
+describe('v2: F2 qr asset', () => {
+  it('uploads kind=qr, signs qr.assetId on render, and clears qr refs on delete', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'qr-happy')
+    const up = await uploadFile(
+      m.cookie,
+      new File([new Uint8Array([1, 2, 3, 4])], 'qr.png', { type: 'image/png' }),
+      'qr',
+    )
+    expect(up.status).toBe(200)
+    const asset = (await up.json()) as { id: string; kind: string }
+    expect(asset.kind).toBe('qr')
+
+    await call('PUT', '/settings/dow-jones', m.cookie, {
+      qr: { assetId: asset.id, x: 1060, y: 660, width: 180, opacity: 1 },
+    })
+    const render = await call('POST', '/render/numbers', m.cookie, {
+      items: [{ lotteryId: 'dow-jones' }],
+      date: '2026-11-07',
+    })
+    expect(render.status).toBe(200)
+    const body = (await render.json()) as { assets: Record<string, string> }
+    expect(body.assets[asset.id]).toMatch(/\/assets\/[^?]+\?exp=\d+&sig=[0-9a-f]+/)
+
+    // override settings carry the same qr reference → also signed
+    const inline = await call('POST', '/render/numbers', m.cookie, {
+      items: [
+        {
+          lotteryId: 'hanoi-regular',
+          settings: { qr: { assetId: asset.id, x: 0, y: 0, width: 10, opacity: 1 } },
+        },
+      ],
+      date: '2026-11-07',
+    })
+    const inlineBody = (await inline.json()) as { assets: Record<string, string> }
+    expect(inlineBody.assets[asset.id]).toBeDefined()
+
+    // DELETE clears qr.assetId references (same path as background / logo)
+    expect((await call('DELETE', `/assets/${asset.id}`, m.cookie)).status).toBe(204)
+    const settings = (await (await call('GET', '/settings/dow-jones', m.cookie)).json()) as {
+      qr: { assetId: unknown; width: number }
+    }
+    expect(settings.qr).toMatchObject({ assetId: null, width: 180 })
+  })
+
+  it("never signs another member's qr asset", async () => {
+    const admin = await adminCookie()
+    const owner = await newMember(admin, 'qr-owner')
+    const thief = await newMember(admin, 'qr-thief')
+    const up = await uploadFile(
+      owner.cookie,
+      new File([new Uint8Array([9, 9, 9])], 'q.png', { type: 'image/png' }),
+      'qr',
+    )
+    const { id } = (await up.json()) as { id: string }
+    const res = await call('POST', '/render/numbers', thief.cookie, {
+      items: [
+        {
+          lotteryId: 'dow-jones',
+          settings: { qr: { assetId: id, x: 0, y: 0, width: 10, opacity: 1 } },
+        },
+      ],
+      date: '2026-11-07',
+    })
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ assets: {} })
+  })
+
+  it('refuses an unknown kind', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'qr-kind')
+    const res = await uploadFile(
+      m.cookie,
+      new File([new Uint8Array([1])], 'x.png', { type: 'image/png' }),
+      'icon',
+    )
+    expect(res.status).toBe(400)
+  })
+
+  it('validates CardSettings.qr bounds the same way as logo', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'qr-bounds')
+    const bad = await call('PUT', '/settings/dow-jones', m.cookie, {
+      qr: { assetId: null, x: 0, y: 0, width: 10, opacity: 2 },
+    })
+    expect(bad.status).toBe(400)
+    const ok = await call('PUT', '/settings/dow-jones', m.cookie, {
+      qr: { assetId: null, x: 0, y: 0, width: 10, opacity: 1 },
+    })
+    expect(ok.status).toBe(200)
+  })
+})
+
+describe('v2: F4 set rounds', () => {
+  it('round-trips rounds and keeps them on reorder when rounds is omitted', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rounds-rt')
+    const created = (await (
+      await call('POST', '/sets', m.cookie, { name: 'รอบๆ' })
+    ).json()) as LotterySet
+    expect(created.rounds).toEqual([])
+
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones', 'thai-gov']
+    const rounds = [2, 2, 1, 3]
+    const set = (await (
+      await call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: ids, rounds })
+    ).json()) as LotterySet
+    expect(set.lotteryIds).toEqual(ids)
+    expect(set.rounds).toEqual(rounds)
+
+    // GET /sets returns the rounds too
+    const all = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    const found = all.find((s) => s.id === created.id)!
+    expect(found.rounds).toEqual(rounds)
+
+    // Reorder (keep same ids) without sending rounds → previous rounds preserved per lottery
+    const reordered = ['dow-jones', 'hanoi-regular', 'hanoi-vip', 'thai-gov']
+    const after = (await (
+      await call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: reordered })
+    ).json()) as LotterySet
+    expect(after.lotteryIds).toEqual(reordered)
+    expect(after.rounds).toEqual([1, 2, 2, 3]) // dow-jones=1, hanoi-regular=2, hanoi-vip=2, thai-gov=3
+
+    // Add a new lottery without rounds → it defaults to 1, others keep their round
+    const added = ['dow-jones', 'hanoi-regular', 'hanoi-vip', 'thai-gov', 'lao-pattana']
+    const addedRes = (await (
+      await call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: added })
+    ).json()) as LotterySet
+    expect(addedRes.rounds).toEqual([1, 2, 2, 3, 1])
+  })
+
+  it('400 when rounds is wrong length, out of range, or sent without lotteryIds', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rounds-bad')
+    const [def] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+
+    const mismatch = await call('PATCH', `/sets/${def.id}`, m.cookie, {
+      lotteryIds: ['dow-jones', 'thai-gov'],
+      rounds: [1],
+    })
+    expect(mismatch.status).toBe(400)
+    expect(await mismatch.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+
+    for (const bad of [0, 21, -1, 1.5]) {
+      const res = await call('PATCH', `/sets/${def.id}`, m.cookie, {
+        lotteryIds: ['dow-jones'],
+        rounds: [bad],
+      })
+      expect(res.status, `round ${bad}`).toBe(400)
+    }
+
+    const orphan = await call('PATCH', `/sets/${def.id}`, m.cookie, { rounds: [1, 2] })
+    expect(orphan.status).toBe(400)
+  })
+
+  it('writes an 82-lottery set in ≤ 50 statements (25-row chunking)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rounds-chunk')
+    // 82 ids: all 82 from the catalog.
+    const ids = LOTTERY_CATALOG.map((l) => l.id)
+    expect(ids.length).toBeGreaterThanOrEqual(82)
+    const rounds = ids.map((_, i) => (i % 20) + 1)
+    const created = (await (
+      await call('POST', '/sets', m.cookie, { name: 'all' })
+    ).json()) as LotterySet
+    const res = await call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: ids, rounds })
+    expect(res.status).toBe(200)
+    const set = (await res.json()) as LotterySet
+    expect(set.lotteryIds).toHaveLength(ids.length)
+    expect(set.rounds).toEqual(rounds)
+    // DB has one row per link, round preserved.
+    const db = getDb(env)
+    const links = await db.select().from(setLotteries).where(eq(setLotteries.setId, created.id))
+    expect(links).toHaveLength(ids.length)
+    const roundByLottery = new Map(links.map((l) => [l.lotteryId, l.round]))
+    for (let i = 0; i < ids.length; i++) expect(roundByLottery.get(ids[i])).toBe(rounds[i])
+  })
+
+  it('new sets default every lottery to round 1 (ensureDefault + POST)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rounds-default')
+    const [def] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    expect(def.rounds).toHaveLength(def.lotteryIds.length)
+    for (const r of def.rounds) expect(r).toBe(1)
+  })
+})
+
+describe('v2: F5 member-created lotteries', () => {
+  async function create(cookie: string, body: Record<string, unknown>) {
+    return call('POST', '/lotteries', cookie, body)
+  }
+
+  it('creates, lists, patches and deletes an own lottery (CRUD)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'custom-crud')
+    const before = (await (await call('GET', '/lotteries', m.cookie)).json()) as {
+      id: string
+      custom: boolean
+    }[]
+    expect(before.every((l) => !l.custom)).toBe(true)
+
+    const res = await create(m.cookie, { name: 'หวยของฉัน', group: 'other' })
+    expect(res.status).toBe(200)
+    const l = (await res.json()) as {
+      id: string
+      name: string
+      shortName: string
+      group: string
+      custom: boolean
+      sortOrder: number
+      accent: string
+      active: boolean
+    }
+    expect(l.id).toMatch(/^m-[0-9A-Za-z]{16}$/)
+    expect(l.custom).toBe(true)
+    expect(l.group).toBe('other')
+    expect(l.shortName).toBe('หวยของฉัน')
+    expect(l.active).toBe(true)
+    expect(l.sortOrder).toBeGreaterThanOrEqual(10_000)
+
+    const list = (await (await call('GET', '/lotteries', m.cookie)).json()) as {
+      id: string
+      custom: boolean
+    }[]
+    expect(list.map((x) => x.id)).toContain(l.id)
+    expect(list.find((x) => x.id === l.id)!.custom).toBe(true)
+
+    const patched = await call('PATCH', `/lotteries/${l.id}`, m.cookie, {
+      name: 'ชื่อใหม่',
+      group: 'hanoi',
+    })
+    expect(patched.status).toBe(200)
+    const after = (await patched.json()) as { name: string; group: string; accent: string }
+    expect(after.name).toBe('ชื่อใหม่')
+    expect(after.group).toBe('hanoi')
+    // accent follows the group palette (hanoi #be123c)
+    expect(after.accent).toBe('#be123c')
+
+    // Use in a set + settings, then delete and verify cascade.
+    const set = (await (
+      await call('POST', '/sets', m.cookie, { name: 's' })
+    ).json()) as LotterySet
+    const put = await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: [l.id] })
+    expect(put.status).toBe(200)
+    await call('PUT', `/settings/${l.id}`, m.cookie, { isDouble: true })
+    expect((await call('DELETE', `/lotteries/${l.id}`, m.cookie)).status).toBe(204)
+    const db = getDb(env)
+    const stillLinked = await db
+      .select()
+      .from(setLotteries)
+      .where(eq(setLotteries.lotteryId, l.id))
+    expect(stillLinked).toHaveLength(0)
+    const stillSettings = await db
+      .select()
+      .from(cardSettings)
+      .where(eq(cardSettings.lotteryId, l.id))
+    expect(stillSettings).toHaveLength(0)
+    // 404 on repeated delete
+    expect((await call('DELETE', `/lotteries/${l.id}`, m.cookie)).status).toBe(404)
+  })
+
+  it('short name defaults to the name without spaces, capped at 20', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'custom-short')
+    const res = await create(m.cookie, { name: 'สั้น สั้น', group: 'stock' })
+    const l = (await res.json()) as { shortName: string }
+    expect(l.shortName).toBe('สั้นสั้น')
+    const long = await create(m.cookie, {
+      name: 'ชื่อยาวมากๆๆๆๆๆๆๆๆๆๆๆๆๆๆๆๆ',
+      shortName: 'ยยยยยยยยยยยยยยยยยยยยยยยยยยยยย',
+      group: 'other',
+    })
+    expect(long.status).toBe(400) // shortName too long
+  })
+
+  it('enforces the 30-lottery quota per member', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'custom-quota')
+    for (let i = 0; i < 30; i++) {
+      const r = await create(m.cookie, { name: `หวย ${i}`, group: 'other' })
+      expect(r.status, `i=${i}`).toBe(200)
+    }
+    const over = await create(m.cookie, { name: 'เกิน', group: 'other' })
+    expect(over.status).toBe(409)
+    expect(await over.json()).toMatchObject({ error: { code: 'QUOTA' } })
+  })
+
+  it('isolates members: another member sees nothing, cannot use/edit/delete', async () => {
+    const admin = await adminCookie()
+    const owner = await newMember(admin, 'custom-owner')
+    const other = await newMember(admin, 'custom-other')
+    const l = (await (await create(owner.cookie, { name: 'ส่วนตัว', group: 'stock' })).json()) as {
+      id: string
+    }
+
+    // GET /lotteries never leaks it
+    const otherList = (await (await call('GET', '/lotteries', other.cookie)).json()) as {
+      id: string
+    }[]
+    expect(otherList.map((x) => x.id)).not.toContain(l.id)
+
+    // PATCH / DELETE on another member's custom → 404
+    expect(
+      (await call('PATCH', `/lotteries/${l.id}`, other.cookie, { name: 'hijack' })).status,
+    ).toBe(404)
+    expect((await call('DELETE', `/lotteries/${l.id}`, other.cookie)).status).toBe(404)
+
+    // Sets: patching their own set to include the other member's custom id fails as unknown.
+    const [def] = (await (await call('GET', '/sets', other.cookie)).json()) as LotterySet[]
+    const setRes = await call('PATCH', `/sets/${def.id}`, other.cookie, { lotteryIds: [l.id] })
+    expect(setRes.status).toBe(400)
+    expect(await setRes.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+
+    // Settings single PUT: 404
+    const singlePut = await call('PUT', `/settings/${l.id}`, other.cookie, { isDouble: true })
+    expect(singlePut.status).toBe(404)
+
+    // Settings bulk PUT: 400 VALIDATION (lottery id unknown to this member)
+    const bulk = await call('PUT', '/settings', other.cookie, {
+      items: [{ lotteryId: l.id, settings: { isDouble: true } }],
+    })
+    expect(bulk.status).toBe(400)
+    expect(await bulk.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+
+    // Render: lottery id unknown to this member → 404
+    const render = await call('POST', '/render/numbers', other.cookie, {
+      items: [{ lotteryId: l.id }],
+      date: '2026-11-07',
+    })
+    expect(render.status).toBe(404)
+  })
+
+  it('admin /admin/lotteries never lists or edits custom lotteries', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'custom-admin')
+    const l = (await (await create(m.cookie, { name: 'ของสมาชิก', group: 'hanoi' })).json()) as {
+      id: string
+    }
+    const list = (await (await call('GET', '/admin/lotteries', admin)).json()) as { id: string }[]
+    expect(list.map((x) => x.id)).not.toContain(l.id)
+    expect(
+      (await call('PATCH', `/admin/lotteries/${l.id}`, admin, { name: 'hijack' })).status,
+    ).toBe(404)
+    expect((await call('DELETE', `/admin/lotteries/${l.id}`, admin)).status).toBe(404)
+  })
+
+  it('deleting the member removes their custom lotteries and link rows', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'custom-cascade')
+    const l = (await (await create(m.cookie, { name: 'จะหาย', group: 'other' })).json()) as {
+      id: string
+    }
+    // Use it in a set first.
+    const set = (await (
+      await call('POST', '/sets', m.cookie, { name: 'x' })
+    ).json()) as LotterySet
+    expect(
+      (await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: [l.id] })).status,
+    ).toBe(200)
+
+    expect((await call('DELETE', `/admin/members/${m.id}`, admin)).status).toBe(204)
+    const db = getDb(env)
+    expect(
+      await db.query.lotteries.findFirst({ where: eq(lotteries.id, l.id) }),
+    ).toBeUndefined()
+    expect(
+      await db.select().from(setLotteries).where(eq(setLotteries.lotteryId, l.id)),
+    ).toHaveLength(0)
+  })
+
+  // --- Adversarial isolation + cascade coverage added by the reviewer (2026-11-07) ---
+
+  it("bulk PUT /settings with a mix of own valid + another member's custom id → 400 writes nothing", async () => {
+    const admin = await adminCookie()
+    const owner = await newMember(admin, 'mix-owner')
+    const attacker = await newMember(admin, 'mix-attacker')
+    const db = getDb(env)
+    const l = (await (await create(owner.cookie, { name: 'secret', group: 'stock' })).json()) as {
+      id: string
+    }
+    // attacker already has a valid setting on hanoi-regular that must stay untouched.
+    expect(
+      (await call('PUT', '/settings/hanoi-regular', attacker.cookie, { marker: 'before' })).status,
+    ).toBe(200)
+    const res = await call('PUT', '/settings', attacker.cookie, {
+      items: [
+        { lotteryId: 'hanoi-regular', settings: { marker: 'after' } }, // valid for attacker
+        { lotteryId: l.id, settings: { marker: 'hijack' } }, // owner's custom — unknown to attacker
+      ],
+    })
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+    // Pre-existing row unchanged; no row inserted for the owner's custom id.
+    const kept = (await (
+      await call('GET', '/settings/hanoi-regular', attacker.cookie)
+    ).json()) as { marker: string }
+    expect(kept.marker).toBe('before')
+    expect(
+      await db.query.cardSettings.findFirst({
+        where: and(eq(cardSettings.memberId, attacker.id), eq(cardSettings.lotteryId, l.id)),
+      }),
+    ).toBeUndefined()
+  })
+
+  it("GET and DELETE /settings/:lotteryId on another member's custom id do not leak or write", async () => {
+    const admin = await adminCookie()
+    const owner = await newMember(admin, 'single-owner')
+    const other = await newMember(admin, 'single-other')
+    const db = getDb(env)
+    const l = (await (await create(owner.cookie, { name: 'mine', group: 'other' })).json()) as {
+      id: string
+    }
+    // Owner saves a known setting on their own custom.
+    expect((await call('PUT', `/settings/${l.id}`, owner.cookie, { marker: 'kept' })).status).toBe(200)
+
+    // GET from the other member: no row for (other, l.id) → 404 (indistinguishable from any absent setting).
+    const get = await call('GET', `/settings/${l.id}`, other.cookie)
+    expect(get.status).toBe(404)
+
+    // DELETE from the other member: 204 (idempotent, no row to touch; must NOT delete owner's row).
+    const del = await call('DELETE', `/settings/${l.id}`, other.cookie)
+    expect(del.status).toBe(204)
+    const ownerRow = await db.query.cardSettings.findFirst({
+      where: and(eq(cardSettings.memberId, owner.id), eq(cardSettings.lotteryId, l.id)),
+    })
+    expect(ownerRow).toBeDefined()
+    expect(JSON.parse(ownerRow!.settingsJson)).toEqual({ marker: 'kept' })
+  })
+
+  it('cascade clears the Default set when a member deletes a custom lottery that was added to it', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'default-cascade')
+    const [def0] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    const l = (await (await create(m.cookie, { name: 'in-default', group: 'other' })).json()) as {
+      id: string
+    }
+    // Add the custom lottery to the Default set (append after the seeded ids).
+    const next = [...def0.lotteryIds, l.id]
+    const patched = await call('PATCH', `/sets/${def0.id}`, m.cookie, { lotteryIds: next })
+    expect(patched.status).toBe(200)
+    expect(((await patched.json()) as LotterySet).lotteryIds).toContain(l.id)
+    expect((await call('DELETE', `/lotteries/${l.id}`, m.cookie)).status).toBe(204)
+    const [defAfter] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    expect(defAfter.lotteryIds).not.toContain(l.id)
+    expect(defAfter.rounds).toHaveLength(defAfter.lotteryIds.length)
+  })
+
+  it("admin PATCH / DELETE on a custom lottery leaves it (and its data) untouched", async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'admin-nomod')
+    const l = (await (await create(m.cookie, { name: 'keep', group: 'hanoi' })).json()) as {
+      id: string
+      name: string
+      accent: string
+    }
+    // Use it in a set + settings so we can verify nothing changes after admin attempts.
+    expect(
+      (await call('PATCH', `/sets/${
+        (((await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[])[0]).id
+      }`, m.cookie, { lotteryIds: [l.id] })).status,
+    ).toBe(200)
+    expect((await call('PUT', `/settings/${l.id}`, m.cookie, { marker: 'owner' })).status).toBe(200)
+
+    expect(
+      (await call('PATCH', `/admin/lotteries/${l.id}`, admin, { name: 'hijack', group: 'other' })).status,
+    ).toBe(404)
+    expect((await call('DELETE', `/admin/lotteries/${l.id}`, admin)).status).toBe(404)
+
+    // Owner still sees their lottery, set link, and setting intact.
+    const list = (await (await call('GET', '/lotteries', m.cookie)).json()) as {
+      id: string
+      name: string
+      custom: boolean
+    }[]
+    const found = list.find((x) => x.id === l.id)!
+    expect(found.name).toBe('keep')
+    expect(found.custom).toBe(true)
+    const setting = (await (
+      await call('GET', `/settings/${l.id}`, m.cookie)
+    ).json()) as { marker: string }
+    expect(setting.marker).toBe('owner')
+    const db = getDb(env)
+    expect(
+      await db.select().from(setLotteries).where(eq(setLotteries.lotteryId, l.id)),
+    ).toHaveLength(1)
+  })
+
+  it('render /render/numbers with a mix of valid + unknown ids → 404 and no counter increment', async () => {
+    const admin = await adminCookie()
+    const owner = await newMember(admin, 'mix-render-owner')
+    const attacker = await newMember(admin, 'mix-render-attacker')
+    const db = getDb(env)
+    const l = (await (await create(owner.cookie, { name: 'secret-r', group: 'stock' })).json()) as {
+      id: string
+    }
+    // Pre-check the attacker's counter (either missing or 0).
+    const beforeMe = (await (await call('GET', '/me', attacker.cookie)).json()) as Member
+    expect(beforeMe.rendersToday).toBe(0)
+
+    const res = await call('POST', '/render/numbers', attacker.cookie, {
+      items: [{ lotteryId: 'dow-jones' }, { lotteryId: l.id }],
+      date: '2026-11-07',
+    })
+    expect(res.status).toBe(404)
+    // Counter stayed at 0; the valid half of the request must not consume renders.
+    const row = await db.query.renderCounters.findFirst({
+      where: and(eq(renderCounters.memberId, attacker.id), eq(renderCounters.day, utcDay())),
+    })
+    expect(row?.count ?? 0).toBe(0)
+  })
+
+  it('a new custom lottery never collides with pre-existing settings/setLotteries rows (defense in depth)', async () => {
+    // Simulate stale references to a never-yet-existing m- id (e.g. a lottery that was deleted and
+    // whose row was recreated with the same id by a buggy client). The cascade on the NEW DELETE
+    // must still clear the stale references.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'stale-refs')
+    const db = getDb(env)
+    const l = (await (await create(m.cookie, { name: 'fresh', group: 'other' })).json()) as {
+      id: string
+    }
+    // Owner's set + settings row.
+    const set = (await (await call('POST', '/sets', m.cookie, { name: 'y' })).json()) as LotterySet
+    expect(
+      (await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: [l.id] })).status,
+    ).toBe(200)
+    expect((await call('PUT', `/settings/${l.id}`, m.cookie, { marker: 'will-cascade' })).status).toBe(200)
+    // DELETE the custom lottery and verify every related row is gone across tables.
+    expect((await call('DELETE', `/lotteries/${l.id}`, m.cookie)).status).toBe(204)
+    expect(
+      await db.query.lotteries.findFirst({ where: eq(lotteries.id, l.id) }),
+    ).toBeUndefined()
+    expect(
+      await db.select().from(setLotteries).where(eq(setLotteries.lotteryId, l.id)),
+    ).toHaveLength(0)
+    expect(
+      await db.select().from(cardSettings).where(eq(cardSettings.lotteryId, l.id)),
+    ).toHaveLength(0)
+    // The set itself survives.
+    expect(
+      await db.query.sets.findFirst({ where: eq(setsTable.id, set.id) }),
+    ).toBeDefined()
+  })
+
+  it('quota is restored after a successful DELETE so a new POST can succeed at the 30 boundary', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'quota-boundary')
+    const ids: string[] = []
+    for (let i = 0; i < 30; i++) {
+      const r = (await (await create(m.cookie, { name: `q${i}`, group: 'other' })).json()) as {
+        id: string
+      }
+      ids.push(r.id)
+    }
+    const overAt30 = await create(m.cookie, { name: 'overflow', group: 'other' })
+    expect(overAt30.status).toBe(409)
+    // Delete one, create one new one: must succeed.
+    expect((await call('DELETE', `/lotteries/${ids[0]}`, m.cookie)).status).toBe(204)
+    const okAgain = await create(m.cookie, { name: 'replacement', group: 'other' })
+    expect(okAgain.status).toBe(200)
+    // sortOrder of the replacement is strictly greater than the previous max (never reused).
+    const fresh = (await okAgain.json()) as { sortOrder: number }
+    expect(fresh.sortOrder).toBeGreaterThanOrEqual(10_000 + 30)
+  })
+
+  it('F4 rounds + F5 custom lottery: a custom lottery in a non-default set round-trips its round', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'f4-f5')
+    const l = (await (await create(m.cookie, { name: 'round-me', group: 'thai' })).json()) as {
+      id: string
+    }
+    const s = (await (await call('POST', '/sets', m.cookie, { name: 'rounds' })).json()) as LotterySet
+    const patched = (await (
+      await call('PATCH', `/sets/${s.id}`, m.cookie, {
+        lotteryIds: ['hanoi-regular', l.id, 'dow-jones'],
+        rounds: [1, 7, 20],
+      })
+    ).json()) as LotterySet
+    expect(patched.lotteryIds).toEqual(['hanoi-regular', l.id, 'dow-jones'])
+    expect(patched.rounds).toEqual([1, 7, 20])
+    // Deleting the custom lottery removes it from the set; the remaining entries keep their rounds.
+    expect((await call('DELETE', `/lotteries/${l.id}`, m.cookie)).status).toBe(204)
+    const [afterSet] = ((await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]).filter(
+      (x) => x.id === s.id,
+    )
+    expect(afterSet.lotteryIds).toEqual(['hanoi-regular', 'dow-jones'])
+    expect(afterSet.rounds).toEqual([1, 20])
+  })
+})
