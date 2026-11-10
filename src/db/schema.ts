@@ -15,6 +15,8 @@ export const members = sqliteTable('members', {
   lastLoginAt: text('last_login_at'),
   createdAt: text('created_at').notNull(),
   rendersTotal: integer('renders_total').notNull().default(0),
+  /** Per-member daily render ceiling override. NULL = fall back to site_settings.render_limit_default (then RENDERS_PER_DAY). */
+  renderLimit: integer('render_limit'),
 })
 
 export const memberSessions = sqliteTable(
@@ -82,7 +84,11 @@ export const setLotteries = sqliteTable(
     /** F4 รอบ: 1..20. Set via PATCH /sets/:id { rounds }. */
     round: integer('round').notNull().default(1),
   },
-  (t) => [primaryKey({ columns: [t.setId, t.lotteryId] })],
+  (t) => [
+    primaryKey({ columns: [t.setId, t.lotteryId] }),
+    // Serves the lottery-scoped cascade on lottery delete (member / admin) without a full scan.
+    index('set_lotteries_lottery_idx').on(t.lotteryId),
+  ],
 )
 
 export const cardSettings = sqliteTable(
@@ -97,7 +103,11 @@ export const cardSettings = sqliteTable(
     settingsJson: text('settings_json').notNull(),
     updatedAt: text('updated_at').notNull(),
   },
-  (t) => [primaryKey({ columns: [t.memberId, t.lotteryId] })],
+  (t) => [
+    primaryKey({ columns: [t.memberId, t.lotteryId] }),
+    // Serves the lottery-scoped cascade on lottery delete (member / admin) without a full scan.
+    index('card_settings_lottery_idx').on(t.lotteryId),
+  ],
 )
 
 export const assets = sqliteTable(
@@ -159,4 +169,16 @@ export const loginAttempts = sqliteTable('login_attempts', {
   key: text('key').primaryKey(),
   failures: integer('failures').notNull().default(0),
   lockedUntil: text('locked_until'),
+})
+
+/**
+ * Admin-editable key/value site settings (contact info shown to members + the default daily
+ * render limit). Empty rows mean "use the compiled-in default from src/lib/siteSettings.ts".
+ * Keys are a fixed whitelist (see SITE_SETTING_KEYS); values are stored as TEXT (integers are
+ * decimal-encoded).
+ */
+export const siteSettings = sqliteTable('site_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: text('updated_at').notNull(),
 })

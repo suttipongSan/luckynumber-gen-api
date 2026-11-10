@@ -4,9 +4,18 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync, rmSync } from 'node:fs'
 import { and, eq } from 'drizzle-orm'
 import app from '../src/index'
-import type { AdminMember, AssetBucket, Bindings, LotterySet, Member } from '../src/types'
+import type {
+  AdminMember,
+  Asset,
+  AssetBucket,
+  Bindings,
+  Lottery,
+  LotterySet,
+  Member,
+  News,
+} from '../src/types'
 import { MAX_SETS } from '../src/types'
-import { hashPassword, signAsset } from '../src/lib/crypto'
+import { hashPassword, hmacSha256Hex, signAsset } from '../src/lib/crypto'
 import { resetLimiter } from '../src/lib/loginLimiter'
 import { getDb } from '../src/db/client'
 import { openDb, runMigrations } from '../scripts/db'
@@ -21,6 +30,7 @@ import {
   sets as setsTable,
   lotteries,
   members,
+  siteSettings,
 } from '../src/db/schema'
 import { utcDay } from '../src/lib/time'
 import { LOTTERY_CATALOG } from '../src/db/catalog'
@@ -286,12 +296,19 @@ describe('member link flow', () => {
     })
     const body = (await res.json()) as { assets: Record<string, string> }
     const url = new URL(body.assets[asset.id])
+    // Render response carries the new URL shape: memberId + ext in the query string.
+    expect(url.searchParams.get('m')).toBeTruthy()
+    expect(url.searchParams.get('e')).toBe('png')
     const file = await app.request(url.pathname + url.search, {}, env)
     expect(file.status).toBe(200)
-    expect(file.headers.get('cache-control')).toBe('private, max-age=600')
+    expect(file.headers.get('cache-control')).toMatch(/^private, max-age=\d+, immutable$/)
     expect(new Uint8Array(await file.arrayBuffer())).toEqual(new Uint8Array([137, 80, 78, 71]))
 
-    const bad = await app.request(`${url.pathname}?exp=${url.searchParams.get('exp')}&sig=${'0'.repeat(64)}`, {}, env)
+    const bad = await app.request(
+      `${url.pathname}?exp=${url.searchParams.get('exp')}&m=${url.searchParams.get('m')}&e=${url.searchParams.get('e')}&sig=${'0'.repeat(64)}`,
+      {},
+      env,
+    )
     expect(bad.status).toBe(403)
   })
 
@@ -586,6 +603,87 @@ describe('review: member auth gates', () => {
     expect(out.headers.get('set-cookie')).toMatch(/ng_session=;.*Max-Age=0/)
     expect((await call('GET', '/me', m.cookie)).status).toBe(401)
   })
+
+  it('login deletes only EXPIRED member_sessions of that member', async () => {
+    const admin = await adminCookie()
+    const m1 = await newMember(admin, 'prune-a')
+    const m2 = await newMember(admin, 'prune-b')
+    const db = getDb(env)
+    const past = new Date(Date.now() - 86400_000).toISOString()
+    // Plant two expired rows for m1 and one expired row for m2. Each member also already has one
+    // unexpired session from newMember (set-password).
+    await db.insert(memberSessions).values([
+      { id: 'prune_a_expired_01________________', memberId: m1.id, expiresAt: past, createdAt: past },
+      { id: 'prune_a_expired_02________________', memberId: m1.id, expiresAt: past, createdAt: past },
+      { id: 'prune_b_expired_01________________', memberId: m2.id, expiresAt: past, createdAt: past },
+    ])
+    expect(
+      (await db.select().from(memberSessions).where(eq(memberSessions.memberId, m1.id))).length,
+    ).toBe(3)
+    expect(
+      (await db.select().from(memberSessions).where(eq(memberSessions.memberId, m2.id))).length,
+    ).toBe(2)
+
+    const login = await req(`/link/${m1.token}/login`, {
+      method: 'POST',
+      body: JSON.stringify({ password: 'password-123' }),
+    })
+    expect(login.status).toBe(204)
+    const now = new Date().toISOString()
+
+    // m1: both expired rows gone, two unexpired rows remain (prior + newly inserted).
+    const rowsA = await db.select().from(memberSessions).where(eq(memberSessions.memberId, m1.id))
+    expect(rowsA).toHaveLength(2)
+    for (const r of rowsA) expect(r.expiresAt > now).toBe(true)
+    // m2 untouched: still 1 unexpired + 1 expired row.
+    const rowsB = await db.select().from(memberSessions).where(eq(memberSessions.memberId, m2.id))
+    expect(rowsB).toHaveLength(2)
+    expect(rowsB.filter((r) => r.expiresAt <= now)).toHaveLength(1)
+    expect(rowsB.filter((r) => r.expiresAt > now)).toHaveLength(1)
+  })
+
+  it('set-password also prunes only this member’s EXPIRED member_sessions', async () => {
+    // A fresh member has no session yet. Create one, manually plant an expired row (as if from a
+    // previous link-visit that somehow logged in — defence in depth), add noise for another member,
+    // then set-password. Only this member's expired row should go.
+    const admin = await adminCookie()
+    const self = await req('/admin/members', {
+      method: 'POST',
+      cookie: admin,
+      body: JSON.stringify({
+        displayName: 'setpw-prune',
+        expiresAt: new Date(Date.now() + 30 * 86400_000).toISOString(),
+      }),
+    })
+    const selfBody = (await self.json()) as AdminMember
+    const noise = await newMember(admin, 'setpw-prune-noise')
+    const db = getDb(env)
+    const past = new Date(Date.now() - 86400_000).toISOString()
+    await db.insert(memberSessions).values([
+      { id: 'setpw_pruneself_exp_______________', memberId: selfBody.id, expiresAt: past, createdAt: past },
+      { id: 'setpw_prunenoise_exp______________', memberId: noise.id, expiresAt: past, createdAt: past },
+    ])
+    const sp = await req(`/link/${selfBody.linkToken}/set-password`, {
+      method: 'POST',
+      body: JSON.stringify({ password: 'password-prune' }),
+    })
+    expect(sp.status).toBe(204)
+    const now = new Date().toISOString()
+    const selfRows = await db
+      .select()
+      .from(memberSessions)
+      .where(eq(memberSessions.memberId, selfBody.id))
+    // Only the freshly-inserted unexpired row remains.
+    expect(selfRows).toHaveLength(1)
+    expect(selfRows[0].expiresAt > now).toBe(true)
+    // Noise member still has its expired row plus its own unexpired set-password session.
+    const noiseRows = await db
+      .select()
+      .from(memberSessions)
+      .where(eq(memberSessions.memberId, noise.id))
+    expect(noiseRows).toHaveLength(2)
+    expect(noiseRows.filter((r) => r.expiresAt <= now)).toHaveLength(1)
+  })
 })
 
 describe('review: cookies', () => {
@@ -855,6 +953,62 @@ describe('review: render limit', () => {
     expect((await call('GET', `/assets/${id}/url`, thief.cookie)).status).toBe(404)
     expect((await call('DELETE', `/assets/${id}`, thief.cookie)).status).toBe(404)
   })
+
+  it('renders_total is NOT incremented when the counter upsert is refused (over limit)', async () => {
+    // Guard property: members.renders_total and render_counters.count must stay consistent, so
+    // an over-limit request must not bump either one. Exercises the `changes() > 0` guard on
+    // the batched members UPDATE (no compensating write).
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rt-guard')
+    const db = getDb(env)
+    const today = utcDay()
+    const todayRow = and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, today))
+    // Seed: 599 renders used today + a non-zero rendersTotal so we can detect any stray increment.
+    await db.insert(renderCounters).values({ memberId: m.id, day: today, count: 599 })
+    await db.update(members).set({ rendersTotal: 123 }).where(eq(members.id, m.id))
+
+    // Over by 1 (599 + 2 > 600) — refused.
+    const over = await render(m.cookie, 2)
+    expect(over.status).toBe(429)
+    expect((await db.query.renderCounters.findFirst({ where: todayRow }))?.count).toBe(599)
+    expect((await db.query.members.findFirst({ where: eq(members.id, m.id) }))?.rendersTotal).toBe(123)
+
+    // Exactly at the boundary — allowed, both counters tick by 1.
+    const okAtBoundary = await render(m.cookie, 1)
+    expect(okAtBoundary.status).toBe(200)
+    expect(await okAtBoundary.json()).toMatchObject({ rendersToday: 600 })
+    expect((await db.query.renderCounters.findFirst({ where: todayRow }))?.count).toBe(600)
+    expect((await db.query.members.findFirst({ where: eq(members.id, m.id) }))?.rendersTotal).toBe(124)
+
+    // One over the boundary — refused, no counter moves.
+    expect((await render(m.cookie, 1)).status).toBe(429)
+    expect((await db.query.renderCounters.findFirst({ where: todayRow }))?.count).toBe(600)
+    expect((await db.query.members.findFirst({ where: eq(members.id, m.id) }))?.rendersTotal).toBe(124)
+  })
+
+  it('first render of a new UTC day inserts the counter and bumps renders_total by n', async () => {
+    // Fresh-insert branch of the upsert (no conflict). `changes()` must still be 1 so the
+    // members UPDATE runs, and the inserted count equals n (≤ MAX_ITEMS_PER_RENDER).
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rt-first')
+    const db = getDb(env)
+    const today = utcDay()
+    // No render_counters row for today yet — this is the insert branch.
+    expect(
+      await db.query.renderCounters.findFirst({
+        where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, today)),
+      }),
+    ).toBeUndefined()
+
+    const res = await render(m.cookie, 5)
+    expect(res.status).toBe(200)
+    expect(await res.json()).toMatchObject({ rendersToday: 5, rendersLimit: 600 })
+    const row = await db.query.renderCounters.findFirst({
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, today)),
+    })
+    expect(row?.count).toBe(5)
+    expect((await db.query.members.findFirst({ where: eq(members.id, m.id) }))?.rendersTotal).toBe(5)
+  })
 })
 
 describe('review: signed asset URLs', () => {
@@ -867,31 +1021,71 @@ describe('review: signed asset URLs', () => {
     }
     const a = await upload()
     const b = await upload()
+    const ext = 'webp'
     const { url } = (await (await call('GET', `/assets/${a}/url`, m.cookie)).json()) as { url: string }
     const u = new URL(url)
     const exp = Number(u.searchParams.get('exp'))
     const sig = u.searchParams.get('sig') ?? ''
-    expect(exp - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(600)
+    const sigMember = u.searchParams.get('m') ?? ''
+    const sigExt = u.searchParams.get('e') ?? ''
+    expect(sigMember).toBe(m.id)
+    expect(sigExt).toBe(ext)
+    // Bucketed exp: at least MIN_TTL (600) seconds in the future, never more than MAX_TTL (2400).
+    const nowSec = Math.floor(Date.now() / 1000)
+    expect(exp - nowSec).toBeGreaterThanOrEqual(600)
+    expect(exp - nowSec).toBeLessThanOrEqual(2400)
+    // Same URL on a second call inside the 30-min bucket, so the browser cache reuses it.
+    const second = (await (await call('GET', `/assets/${a}/url`, m.cookie)).json()) as { url: string }
+    expect(second.url).toBe(url)
 
+    const q = `exp=${exp}&m=${encodeURIComponent(sigMember)}&e=${encodeURIComponent(sigExt)}&sig=${sig}`
     const get = (path: string) => app.request(path, {}, env)
-    const ok = await get(`/assets/${a}?exp=${exp}&sig=${sig}`)
+    const ok = await get(`/assets/${a}?${q}`)
     expect(ok.status).toBe(200)
-    expect(ok.headers.get('cache-control')).toBe('private, max-age=600')
+    // Immutable since the same URL always points at the same bytes.
+    expect(ok.headers.get('cache-control')).toMatch(/^private, max-age=\d+, immutable$/)
+    const maxAge = Number(/max-age=(\d+)/.exec(ok.headers.get('cache-control') ?? '')?.[1] ?? '0')
+    expect(maxAge).toBeGreaterThan(0)
+    expect(maxAge).toBeLessThanOrEqual(exp - nowSec + 5)
     expect(ok.headers.get('x-content-type-options')).toBe('nosniff')
     expect(ok.headers.get('content-type')).toBe('image/webp')
 
-    expect((await get(`/assets/${b}?exp=${exp}&sig=${sig}`)).status).toBe(403) // other asset
-    expect((await get(`/assets/${a}?exp=${exp + 3600}&sig=${sig}`)).status).toBe(403) // exp bumped
-    expect((await get(`/assets/${a}`)).status).toBe(403) // unsigned
-    expect((await get(`/assets/${a}?exp=${exp}`)).status).toBe(403) // no sig
-    const wrong = await signAsset('not-the-secret', a, 300)
-    expect((await get(`/assets/${a}?exp=${wrong.exp}&sig=${wrong.sig}`)).status).toBe(403)
-    // correctly signed but already expired
-    const old = await signAsset(env.ASSET_SIGNING_SECRET, a, 600, Date.now() - 601_000)
-    expect((await get(`/assets/${a}?exp=${old.exp}&sig=${old.sig}`)).status).toBe(403)
-    // correctly signed but valid far longer than the API ever issues
-    const far = await signAsset(env.ASSET_SIGNING_SECRET, a, 86400)
-    expect((await get(`/assets/${a}?exp=${far.exp}&sig=${far.sig}`)).status).toBe(403)
+    // other asset id (same sig/member/ext) — rejected
+    expect((await get(`/assets/${b}?${q}`)).status).toBe(403)
+    // exp bumped — sig no longer matches
+    expect((await get(`/assets/${a}?exp=${exp + 1800}&m=${sigMember}&e=${sigExt}&sig=${sig}`)).status).toBe(403)
+    // unsigned fall-through
+    expect((await get(`/assets/${a}`)).status).toBe(403)
+    // missing sig
+    expect((await get(`/assets/${a}?exp=${exp}&m=${sigMember}&e=${sigExt}`)).status).toBe(403)
+    // missing memberId
+    expect((await get(`/assets/${a}?exp=${exp}&e=${sigExt}&sig=${sig}`)).status).toBe(403)
+    // missing ext
+    expect((await get(`/assets/${a}?exp=${exp}&m=${sigMember}&sig=${sig}`)).status).toBe(403)
+    // wrong-member download link, right sig over the wrong payload
+    const wrongMember = await signAsset('not-the-secret', a, m.id, ext)
+    expect(
+      (await get(`/assets/${a}?exp=${wrongMember.exp}&m=${m.id}&e=${ext}&sig=${wrongMember.sig}`))
+        .status,
+    ).toBe(403)
+    // tampering the memberId ⇒ signature mismatch
+    expect(
+      (await get(`/assets/${a}?exp=${exp}&m=otherMember00000&e=${sigExt}&sig=${sig}`)).status,
+    ).toBe(403)
+    // correctly signed but already expired (nowMs far in the past ⇒ bucketed exp is in the past)
+    const old = await signAsset(env.ASSET_SIGNING_SECRET, a, m.id, ext, Date.now() - 86_400_000)
+    expect((await get(`/assets/${a}?exp=${old.exp}&m=${m.id}&e=${ext}&sig=${old.sig}`)).status).toBe(403)
+    // correctly signed by this secret but with an exp a day ahead (bypasses the bucket logic
+    // by crafting the signature directly) — rejected because exp > now + MAX_TTL + 60.
+    const farExp = Math.floor(Date.now() / 1000) + 86_400
+    const farSig = await hmacSha256Hex(env.ASSET_SIGNING_SECRET, `${a}:${m.id}:${ext}:${farExp}`)
+    expect((await get(`/assets/${a}?exp=${farExp}&m=${m.id}&e=${ext}&sig=${farSig}`)).status).toBe(403)
+    // Another member cannot reuse owner's signed URL by replacing their member id.
+    const other = await newMember(admin, 'other-sig')
+    const stolen = await signAsset(env.ASSET_SIGNING_SECRET, a, other.id, ext)
+    expect(
+      (await get(`/assets/${a}?exp=${stolen.exp}&m=${other.id}&e=${ext}&sig=${stolen.sig}`)).status,
+    ).toBe(404)
   })
 
   it('upload refuses non-images, SVG, empty, oversize and bad kind; enforces the 2-files-per-kind quota', async () => {
@@ -941,6 +1135,118 @@ describe('review: signed asset URLs', () => {
     }
     expect(s.backgroundAssetId).toBeNull()
     expect(s.logo).toMatchObject({ assetId: null, width: 3 })
+  })
+
+  it('clears references across 80 card_settings rows in one bounded batch', async () => {
+    // Regression for the N+1 loop that could exceed the D1 50-statements-per-request limit.
+    // Here we use 80 referencing lotteries (all the catalog ids) — well above 50 — and the
+    // DELETE must still succeed with no dangling references.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'assetdel-many')
+    const ids = LOTTERY_CATALOG.map((l) => l.id)
+    expect(ids.length).toBeGreaterThanOrEqual(60)
+    const up = await uploadFile(
+      m.cookie,
+      new File([new Uint8Array([9])], 'bg.png', { type: 'image/png' }),
+      'background',
+    )
+    const { id } = (await up.json()) as { id: string }
+    // Seed card_settings rows that all reference `id` as background + logo + qr.
+    const items = ids.map((lid) => ({
+      lotteryId: lid,
+      settings: {
+        backgroundAssetId: id,
+        logo: { assetId: id, x: 1, y: 2, width: 10, opacity: 0.5 },
+        qr: { assetId: id, x: 3, y: 4, width: 20, opacity: 1 },
+      },
+    }))
+    const put = await call('PUT', '/settings', m.cookie, { items })
+    expect(put.status).toBe(200)
+    const del = await call('DELETE', `/assets/${id}`, m.cookie)
+    expect(del.status).toBe(204)
+    const all = (await (await call('GET', '/settings', m.cookie)).json()) as Record<string, {
+      backgroundAssetId: unknown
+      logo?: { assetId: unknown; width?: number }
+      qr?: { assetId: unknown; width?: number }
+    }>
+    expect(Object.keys(all)).toHaveLength(ids.length)
+    for (const lid of ids) {
+      const s = all[lid]
+      expect(s, lid).toBeDefined()
+      expect(s.backgroundAssetId, lid).toBeNull()
+      expect(s.logo?.assetId, lid).toBeNull()
+      // Keeps other logo fields intact (asset delete only nulls the id).
+      expect(s.logo?.width, lid).toBe(10)
+      expect(s.qr?.assetId, lid).toBeNull()
+      expect(s.qr?.width, lid).toBe(20)
+    }
+    expect([...r2.objects.keys()].some((k) => k.includes(id))).toBe(false)
+  })
+
+  it('GET /assets includes a url field that serves the bytes without a /url round trip', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'list-urls')
+    const upOne = (name: string, kind: string, byte: number) =>
+      uploadFile(
+        m.cookie,
+        new File([new Uint8Array([byte])], `${name}.png`, { type: 'image/png' }),
+        kind,
+      )
+    expect((await upOne('bg', 'background', 1)).status).toBe(200)
+    expect((await upOne('lg', 'logo', 4)).status).toBe(200)
+    expect((await upOne('qr', 'qr', 7)).status).toBe(200)
+    const list = (await (await call('GET', '/assets', m.cookie)).json()) as (Asset & {
+      url?: string
+    })[]
+    expect(list).toHaveLength(3)
+    for (const a of list) {
+      expect(a.url, a.fileName).toBeTruthy()
+      const u = new URL(a.url!)
+      expect(u.searchParams.get('m')).toBe(m.id)
+      expect(u.searchParams.get('e')).toBe('png')
+      const r = await app.request(u.pathname + u.search, {}, env)
+      expect(r.status, a.fileName).toBe(200)
+      expect(r.headers.get('cache-control')).toMatch(/^private, max-age=\d+, immutable$/)
+    }
+    // A second GET /assets inside the same 30-min bucket returns the SAME signed URLs.
+    const again = (await (await call('GET', '/assets', m.cookie)).json()) as (Asset & { url?: string })[]
+    expect(again.map((a) => a.url)).toEqual(list.map((a) => a.url))
+  })
+
+  it('upload quota check still refuses the 3rd file per kind after count(*) switch', async () => {
+    // Guard regression: the count query was rewritten to count(*) rather than selecting ids.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'quota-count')
+    const up = (name: string) =>
+      uploadFile(m.cookie, new File([new Uint8Array([1])], name, { type: 'image/png' }), 'logo')
+    expect((await up('a.png')).status).toBe(200)
+    expect((await up('b.png')).status).toBe(200)
+    const third = await up('c.png')
+    expect(third.status).toBe(409)
+    expect(await third.json()).toMatchObject({ error: { code: 'QUOTA' } })
+  })
+
+  it('download works without a D1 read even if the assets row is manually removed', async () => {
+    // The download handler rebuilds the R2 key from the signed URL (memberId + ext), so it
+    // does not touch D1. Prove that by signing a URL, deleting the assets row behind its
+    // back (leaving R2 intact), and seeing the download still succeed.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'no-d1-read')
+    const bytes = new Uint8Array([11, 22, 33])
+    const up = await uploadFile(
+      m.cookie,
+      new File([bytes], 'bg.png', { type: 'image/png' }),
+      'background',
+    )
+    const { id } = (await up.json()) as { id: string }
+    const { url } = (await (await call('GET', `/assets/${id}/url`, m.cookie)).json()) as { url: string }
+    // Remove the row only; keep the R2 object in place.
+    const db = getDb(env)
+    await db.delete(assetsTable).where(eq(assetsTable.id, id))
+    const u = new URL(url)
+    const file = await app.request(u.pathname + u.search, {}, env)
+    expect(file.status).toBe(200)
+    expect(new Uint8Array(await file.arrayBuffer())).toEqual(bytes)
   })
 })
 
@@ -1512,7 +1818,9 @@ describe('v2: F2 qr asset', () => {
     })
     expect(render.status).toBe(200)
     const body = (await render.json()) as { assets: Record<string, string> }
-    expect(body.assets[asset.id]).toMatch(/\/assets\/[^?]+\?exp=\d+&sig=[0-9a-f]+/)
+    expect(body.assets[asset.id]).toMatch(
+      /\/assets\/[^?]+\?exp=\d+&m=[0-9A-Za-z]+&e=[a-z]+&sig=[0-9a-f]+/,
+    )
 
     // override settings carry the same qr reference → also signed
     const inline = await call('POST', '/render/numbers', m.cookie, {
@@ -1674,6 +1982,174 @@ describe('v2: F4 set rounds', () => {
     const [def] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
     expect(def.rounds).toHaveLength(def.lotteryIds.length)
     for (const r of def.rounds) expect(r).toBe(1)
+  })
+})
+
+describe('PATCH /sets/:id diff', () => {
+  async function newSet(cookie: string, ids: string[], rounds?: number[]): Promise<LotterySet> {
+    const created = (await (await call('POST', '/sets', cookie, { name: 'diff' })).json()) as LotterySet
+    const body: Record<string, unknown> = { lotteryIds: ids }
+    if (rounds) body.rounds = rounds
+    const patched = await call('PATCH', `/sets/${created.id}`, cookie, body)
+    expect(patched.status).toBe(200)
+    return (await patched.json()) as LotterySet
+  }
+
+  it('reorder keeps every round and leaves the client-sent order', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-reorder')
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones', 'thai-gov']
+    const rounds = [1, 2, 3, 4]
+    const set = await newSet(m.cookie, ids, rounds)
+    const reordered = ['thai-gov', 'hanoi-regular', 'dow-jones', 'hanoi-vip']
+    const res = (await (
+      await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: reordered })
+    ).json()) as LotterySet
+    expect(res.lotteryIds).toEqual(reordered)
+    // Rounds follow each lottery, not the position.
+    expect(res.rounds).toEqual([4, 1, 3, 2])
+    // GET returns the same order (sort_order in DB may be gapped but the ORDER BY preserves it).
+    const [again] = ((await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]).filter(
+      (s) => s.id === set.id,
+    )
+    expect(again.lotteryIds).toEqual(reordered)
+    expect(again.rounds).toEqual([4, 1, 3, 2])
+  })
+
+  it('remove-middle keeps the remaining order and rounds', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-remove-mid')
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones', 'thai-gov', 'lao-pattana']
+    const rounds = [5, 6, 7, 8, 9]
+    const set = await newSet(m.cookie, ids, rounds)
+    const after = ['hanoi-regular', 'hanoi-vip', 'thai-gov', 'lao-pattana']
+    const res = (await (
+      await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: after })
+    ).json()) as LotterySet
+    expect(res.lotteryIds).toEqual(after)
+    expect(res.rounds).toEqual([5, 6, 8, 9])
+    const db = getDb(env)
+    const links = await db.select().from(setLotteries).where(eq(setLotteries.setId, set.id))
+    expect(links).toHaveLength(after.length)
+    // The removed lottery is gone from the DB.
+    expect(links.map((l) => l.lotteryId)).not.toContain('dow-jones')
+  })
+
+  it('add appends new ids with round 1 and keeps the originals untouched', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-add')
+    const ids = ['hanoi-regular', 'hanoi-vip']
+    const rounds = [3, 4]
+    const set = await newSet(m.cookie, ids, rounds)
+    const after = ['hanoi-regular', 'hanoi-vip', 'dow-jones', 'thai-gov']
+    const res = (await (
+      await call('PATCH', `/sets/${set.id}`, m.cookie, { lotteryIds: after })
+    ).json()) as LotterySet
+    expect(res.lotteryIds).toEqual(after)
+    expect(res.rounds).toEqual([3, 4, 1, 1])
+  })
+
+  it('rounds-only change updates rounds without reshuffling the DB rows', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-rounds-only')
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones']
+    const set = await newSet(m.cookie, ids, [1, 1, 1])
+    const res = (await (
+      await call('PATCH', `/sets/${set.id}`, m.cookie, {
+        lotteryIds: ids,
+        rounds: [5, 6, 7],
+      })
+    ).json()) as LotterySet
+    expect(res.lotteryIds).toEqual(ids)
+    expect(res.rounds).toEqual([5, 6, 7])
+    const db = getDb(env)
+    const links = await db.select().from(setLotteries).where(eq(setLotteries.setId, set.id))
+    const map = new Map(links.map((l) => [l.lotteryId, l.round]))
+    expect(map.get('hanoi-regular')).toBe(5)
+    expect(map.get('hanoi-vip')).toBe(6)
+    expect(map.get('dow-jones')).toBe(7)
+  })
+
+  it('mixed change (reorder + add + remove + rounds + rename) survives in one PATCH', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-mixed')
+    const ids = ['hanoi-regular', 'hanoi-vip', 'dow-jones', 'thai-gov']
+    const set = await newSet(m.cookie, ids, [1, 2, 3, 4])
+    // Remove thai-gov, add lao-pattana, reorder, change rounds, and rename at the same time.
+    const after = ['dow-jones', 'lao-pattana', 'hanoi-regular']
+    const newRounds = [11, 12, 13]
+    const res = await call('PATCH', `/sets/${set.id}`, m.cookie, {
+      name: 'mixed-up',
+      lotteryIds: after,
+      rounds: newRounds,
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as LotterySet
+    expect(body.name).toBe('mixed-up')
+    expect(body.lotteryIds).toEqual(after)
+    expect(body.rounds).toEqual(newRounds)
+    // Round-trip through GET /sets.
+    const [again] = ((await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]).filter(
+      (s) => s.id === set.id,
+    )
+    expect(again.name).toBe('mixed-up')
+    expect(again.lotteryIds).toEqual(after)
+    expect(again.rounds).toEqual(newRounds)
+    // hanoi-vip is gone, lao-pattana is in.
+    const db = getDb(env)
+    const links = await db.select().from(setLotteries).where(eq(setLotteries.setId, set.id))
+    expect(links).toHaveLength(after.length)
+    expect(links.map((l) => l.lotteryId)).toContain('lao-pattana')
+    expect(links.map((l) => l.lotteryId)).not.toContain('hanoi-vip')
+    expect(links.map((l) => l.lotteryId)).not.toContain('thai-gov')
+  })
+
+  it('rename + lotteries in one PATCH applies both (non-default set)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-rename-both')
+    const created = (await (await call('POST', '/sets', m.cookie, { name: 'old' })).json()) as LotterySet
+    const res = await call('PATCH', `/sets/${created.id}`, m.cookie, {
+      name: 'new',
+      lotteryIds: ['dow-jones', 'thai-gov'],
+      rounds: [5, 6],
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as LotterySet
+    expect(body.name).toBe('new')
+    expect(body.lotteryIds).toEqual(['dow-jones', 'thai-gov'])
+    expect(body.rounds).toEqual([5, 6])
+  })
+
+  it('full 80+-lottery PATCH round-trips every id and round', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-full')
+    const ids = LOTTERY_CATALOG.map((l) => l.id)
+    const rounds = ids.map((_, i) => ((i * 3) % 20) + 1)
+    const created = (await (await call('POST', '/sets', m.cookie, { name: 'all' })).json()) as LotterySet
+    const res = await call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: ids, rounds })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as LotterySet
+    expect(body.lotteryIds).toEqual(ids)
+    expect(body.rounds).toEqual(rounds)
+    const [again] = ((await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]).filter(
+      (s) => s.id === created.id,
+    )
+    expect(again.lotteryIds).toEqual(ids)
+    expect(again.rounds).toEqual(rounds)
+  })
+
+  it('GET /sets is idempotent (same output on repeated calls)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'diff-idem')
+    const a = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    const b = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    const c = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    expect(b).toEqual(a)
+    expect(c).toEqual(a)
+    // Still exactly one default set after the repeated reads — no accidental second ensureDefault.
+    const db = getDb(env)
+    const rows = await db.query.sets.findMany({ where: eq(setsTable.memberId, m.id) })
+    expect(rows.filter((r) => r.isDefault)).toHaveLength(1)
   })
 })
 
@@ -2077,5 +2553,712 @@ describe('v2: F5 member-created lotteries', () => {
     )
     expect(afterSet.lotteryIds).toEqual(['hanoi-regular', 'dow-jones'])
     expect(afterSet.rounds).toEqual([1, 20])
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// Bootstrap endpoint (TASK E): one call replaces /me + /lotteries + /sets + /settings +
+// /assets + /news on page load. Expired / disabled members get me+news only.
+// ---------------------------------------------------------------------------------------------
+
+describe('GET /bootstrap', () => {
+  interface BootstrapInactive {
+    me: Member
+    news: News[]
+  }
+  interface BootstrapActive extends BootstrapInactive {
+    lotteries: Lottery[]
+    sets: LotterySet[]
+    settings: Record<string, unknown>
+    assets: Asset[]
+  }
+
+  it('401 UNAUTHENTICATED without a session', async () => {
+    const res = await req('/bootstrap')
+    expect(res.status).toBe(401)
+    expect(await res.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } })
+  })
+
+  it('active member: shape equals the individual endpoints and starter sets are created', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-active')
+
+    // Upload an asset so the signed-url path is exercised.
+    const up = await uploadFile(
+      m.cookie,
+      new File([new Uint8Array([1, 2, 3])], 'bg.png', { type: 'image/png' }),
+      'background',
+    )
+    expect(up.status).toBe(200)
+    const asset = (await up.json()) as Asset
+
+    // Save a card setting so the settings map is non-empty.
+    expect(
+      (await call('PUT', '/settings/dow-jones', m.cookie, { marker: 'bootstrap' })).status,
+    ).toBe(200)
+
+    // Run one render so rendersToday > 0.
+    expect(
+      (await call('POST', '/render/numbers', m.cookie, {
+        items: [{ lotteryId: 'dow-jones' }],
+        date: '2026-11-07',
+      })).status,
+    ).toBe(200)
+
+    // Fetch bootstrap and each individual endpoint. The bootstrap shape must match.
+    const bootRes = await req('/bootstrap', { cookie: m.cookie })
+    expect(bootRes.status).toBe(200)
+    const boot = (await bootRes.json()) as BootstrapActive
+
+    async function jsonOf(path: string) {
+      return (await req(path, { cookie: m.cookie })).json()
+    }
+    const [me, lotteriesRes, setsRes, settingsRes, assetsRes, newsRes] = await Promise.all([
+      jsonOf('/me'),
+      jsonOf('/lotteries'),
+      jsonOf('/sets'),
+      jsonOf('/settings'),
+      jsonOf('/assets'),
+      jsonOf('/news'),
+    ])
+
+    // `me` returned by bootstrap and /me are built from the same member row + today's
+    // counter, so they must be identical.
+    expect(boot.me).toEqual(me)
+    expect(boot.me.rendersToday).toBe(1)
+    expect(boot.lotteries).toEqual(lotteriesRes)
+    expect(boot.sets).toEqual(setsRes)
+    expect(boot.settings).toEqual(settingsRes)
+    // Assets are signed per call; the signed exp is bucketed to the 30-min boundary so inside
+    // one bucket the two endpoints return the same URL.
+    expect(boot.assets).toEqual(assetsRes)
+    expect(boot.news).toEqual(newsRes)
+
+    // Sanity on the content itself.
+    expect(boot.lotteries.length).toBeGreaterThanOrEqual(10)
+    expect(boot.sets.length).toBe(STARTER_SETS.length)
+    expect(boot.sets[0]).toMatchObject({ isDefault: true })
+    expect(boot.settings['dow-jones']).toMatchObject({ marker: 'bootstrap' })
+    expect(boot.assets.find((a) => a.id === asset.id)?.url).toBeTruthy()
+  })
+
+  it('first call creates the starter sets; a second call does not create more', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-starter-once')
+
+    // First /bootstrap also creates the starter sets (no prior GET /sets).
+    const first = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as BootstrapActive
+    expect(first.sets).toHaveLength(STARTER_SETS.length)
+    expect(first.sets.filter((s) => s.isDefault)).toHaveLength(1)
+
+    // Second /bootstrap sees the same sets and does NOT create more.
+    const second = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as BootstrapActive
+    expect(second.sets.map((s) => s.id).sort()).toEqual(first.sets.map((s) => s.id).sort())
+
+    // DB confirms: still exactly STARTER_SETS rows.
+    const db = getDb(env)
+    const all = await db.select().from(setsTable).where(eq(setsTable.memberId, m.id))
+    expect(all).toHaveLength(STARTER_SETS.length)
+  })
+
+  it('expired member → { me, news } only (no lotteries / sets / settings / assets)', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-expired')
+    const patch = (body: unknown) => call('PATCH', `/admin/members/${m.id}`, admin, body)
+    // Flip the member expired AFTER their session was created.
+    await patch({ expiresAt: new Date(Date.now() - 1000).toISOString() })
+
+    const bootRes = await req('/bootstrap', { cookie: m.cookie })
+    expect(bootRes.status).toBe(200)
+    const boot = (await bootRes.json()) as Partial<BootstrapActive>
+    // Shape matches the individual /me + /news endpoints.
+    const meSolo = await (await req('/me', { cookie: m.cookie })).json()
+    const newsSolo = await (await req('/news', { cookie: m.cookie })).json()
+    expect(boot.me).toEqual(meSolo)
+    expect(boot.me).toMatchObject({ expired: true, disabled: false })
+    expect(boot.news).toEqual(newsSolo)
+    expect(boot.lotteries).toBeUndefined()
+    expect(boot.sets).toBeUndefined()
+    expect(boot.settings).toBeUndefined()
+    expect(boot.assets).toBeUndefined()
+  })
+
+  it('disabled member → { me, news } only', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-disabled')
+    await call('PATCH', `/admin/members/${m.id}`, admin, { disabled: true })
+    const boot = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as Partial<
+      BootstrapActive
+    >
+    const newsSolo = await (await req('/news', { cookie: m.cookie })).json()
+    expect(boot.me).toMatchObject({ disabled: true })
+    expect(boot.news).toEqual(newsSolo)
+    expect(boot.lotteries).toBeUndefined()
+    expect(boot.sets).toBeUndefined()
+  })
+
+  it('CSRF: state-changing request not blocked (GET has no body), but foreign origin still rejected for writes', async () => {
+    // GETs do not go through the Origin guard; this just confirms /bootstrap is a GET.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-get-only')
+    const res = await req('/bootstrap', {
+      cookie: m.cookie,
+      headers: { Origin: 'https://evil.example' },
+    })
+    // The Origin guard only applies to state-changing methods; bootstrap is a GET so this
+    // succeeds. CORS (not tested here) would hide the response from a browser.
+    expect(res.status).toBe(200)
+  })
+
+  it('assets are ordered by createdAt, matching GET /assets', async () => {
+    // Guard: bootstrap must sort assets the same way as GET /assets so AssetsPage,
+    // SinglePage and ApplyToSetModal (which render in array order) do not shuffle items
+    // between the first page load (/bootstrap) and any later reload() (GET /assets).
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-asset-order')
+    // Upload three assets of the same kind, forcing distinct createdAt values via
+    // the member's one-per-kind quota of 2… use three kinds instead so the uploads
+    // succeed and we still get three rows with monotonic timestamps.
+    expect(
+      (await uploadFile(
+        m.cookie,
+        new File([new Uint8Array([1])], 'a.png', { type: 'image/png' }),
+        'background',
+      )).status,
+    ).toBe(200)
+    expect(
+      (await uploadFile(
+        m.cookie,
+        new File([new Uint8Array([2])], 'b.png', { type: 'image/png' }),
+        'logo',
+      )).status,
+    ).toBe(200)
+    expect(
+      (await uploadFile(
+        m.cookie,
+        new File([new Uint8Array([3])], 'c.png', { type: 'image/png' }),
+        'qr',
+      )).status,
+    ).toBe(200)
+
+    // Rewrite createdAt so the id-based insertion order is NOT the same as the
+    // createdAt order. Only a working ORDER BY createdAt in /bootstrap matches GET /assets.
+    const db = getDb(env)
+    const rows = await db.select().from(assetsTable).where(eq(assetsTable.memberId, m.id))
+    const sortedRows = [...rows]
+      .slice()
+      .sort((a, b) => a.id.localeCompare(b.id))
+    const stamps = [
+      '2026-11-01T00:00:00.000Z',
+      '2026-11-02T00:00:00.000Z',
+      '2026-11-03T00:00:00.000Z',
+    ]
+    // Reverse: highest id → earliest createdAt; lowest id → latest createdAt.
+    for (let i = 0; i < sortedRows.length; i++) {
+      const r = sortedRows[sortedRows.length - 1 - i]
+      await db
+        .update(assetsTable)
+        .set({ createdAt: stamps[i] })
+        .where(eq(assetsTable.id, r.id))
+    }
+
+    const boot = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as {
+      assets: Asset[]
+    }
+    const list = (await (await call('GET', '/assets', m.cookie)).json()) as Asset[]
+    expect(boot.assets.map((a) => a.id)).toEqual(list.map((a) => a.id))
+    // Confirm the order is createdAt-ascending (not id-ascending).
+    const bootStamps = boot.assets.map((a) => a.createdAt)
+    expect(bootStamps).toEqual([...bootStamps].sort())
+  })
+})
+
+describe('review: DELETE /assets R2 failure', () => {
+  it('leaves the D1 row + R2 object + card_settings refs intact when R2 delete throws', async () => {
+    // Guard property: R2 delete runs BEFORE the D1 batch so an R2 failure never orphans
+    // the R2 object (the download handler no longer reads D1, and admin member-delete only
+    // knows the keys that assets still rows reference). With this order, a transient R2
+    // failure is retryable — nothing has changed in D1 yet.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'del-r2-fail')
+    const up = await uploadFile(
+      m.cookie,
+      new File([new Uint8Array([42])], 'bg.png', { type: 'image/png' }),
+      'background',
+    )
+    const { id } = (await up.json()) as { id: string }
+    await call('PUT', '/settings/dow-jones', m.cookie, {
+      backgroundAssetId: id,
+      logo: { assetId: id, x: 1, y: 2, width: 3, opacity: 0.5 },
+    })
+
+    // Monkey-patch r2.delete to throw once; restore it afterwards.
+    const realDelete = r2.delete.bind(r2)
+    let threw = false
+    r2.delete = async () => {
+      threw = true
+      throw new Error('simulated r2 outage')
+    }
+    let failed = await call('DELETE', `/assets/${id}`, m.cookie)
+    expect(threw).toBe(true)
+    // Expresses as a 5xx surface to the client (uncaught by app error handler → 500).
+    expect(failed.status).toBeGreaterThanOrEqual(500)
+
+    // Nothing changed: the row is still there, the R2 object is still there, and the
+    // card_settings references still point at the asset.
+    const db = getDb(env)
+    expect(await db.query.assets.findFirst({ where: eq(assetsTable.id, id) })).toBeTruthy()
+    expect([...r2.objects.keys()].some((k) => k.includes(id))).toBe(true)
+    const stillRefs = (await (await call('GET', '/settings/dow-jones', m.cookie)).json()) as {
+      backgroundAssetId: string
+      logo: { assetId: string }
+    }
+    expect(stillRefs.backgroundAssetId).toBe(id)
+    expect(stillRefs.logo.assetId).toBe(id)
+
+    // Restore R2 and retry: the delete now succeeds and cleans up both sides.
+    r2.delete = realDelete
+    const ok = await call('DELETE', `/assets/${id}`, m.cookie)
+    expect(ok.status).toBe(204)
+    expect(await db.query.assets.findFirst({ where: eq(assetsTable.id, id) })).toBeUndefined()
+    expect([...r2.objects.keys()].some((k) => k.includes(id))).toBe(false)
+    const cleared = (await (await call('GET', '/settings/dow-jones', m.cookie)).json()) as {
+      backgroundAssetId: unknown
+      logo: { assetId: unknown; width: number }
+    }
+    expect(cleared.backgroundAssetId).toBeNull()
+    expect(cleared.logo.assetId).toBeNull()
+  })
+})
+
+describe('contacts + admin /admin/settings', () => {
+  // The site_settings table is shared across tests; wipe it between cases so a previous
+  // test's PUT doesn't leak into the next one's defaults.
+  beforeEach(async () => {
+    await getDb(env).delete(siteSettings)
+  })
+
+  it('GET /contacts (no auth) falls back to defaults, Cache-Control is public, max-age=60', async () => {
+    const res = await req('/contacts')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('cache-control')).toBe('public, max-age=60')
+    expect(await res.json()).toEqual({
+      line: { id: '@numbergen', url: 'https://line.me/R/ti/p/@numbergen' },
+      telegram: { id: '@numbergen_support', url: 'https://t.me/numbergen_support' },
+    })
+  })
+
+  it('GET /contacts hides a channel when its id is empty', async () => {
+    const admin = await adminCookie()
+    const put = await call('PUT', '/admin/settings', admin, {
+      contactLineId: '',
+      contactLineUrl: '',
+      contactTelegramId: '@tg_support',
+      contactTelegramUrl: 'https://t.me/tg_support',
+      renderLimitDefault: 500,
+    })
+    expect(put.status).toBe(200)
+    const res = await (await req('/contacts')).json()
+    expect(res).toEqual({
+      line: null,
+      telegram: { id: '@tg_support', url: 'https://t.me/tg_support' },
+    })
+  })
+
+  it('GET /contacts hides a channel whose id is set but whose URL is empty', async () => {
+    const admin = await adminCookie()
+    const put = await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@pnphoto',
+      contactLineUrl: '',
+      contactTelegramId: '@tg_support',
+      contactTelegramUrl: 'https://t.me/tg_support',
+      renderLimitDefault: 600,
+    })
+    expect(put.status).toBe(200)
+    const res = await (await req('/contacts')).json()
+    expect(res).toEqual({
+      line: null,
+      telegram: { id: '@tg_support', url: 'https://t.me/tg_support' },
+    })
+  })
+
+  it('GET /admin/settings returns the compiled-in defaults when no row exists', async () => {
+    const admin = await adminCookie()
+    const res = await (await call('GET', '/admin/settings', admin)).json()
+    expect(res).toEqual({
+      contactLineId: '@numbergen',
+      contactLineUrl: 'https://line.me/R/ti/p/@numbergen',
+      contactTelegramId: '@numbergen_support',
+      contactTelegramUrl: 'https://t.me/numbergen_support',
+      renderLimitDefault: 600,
+    })
+  })
+
+  it('PUT /admin/settings persists, GET returns the saved values, and /contacts reflects them', async () => {
+    const admin = await adminCookie()
+    const put = await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@pnphoto',
+      contactLineUrl: 'https://line.me/R/ti/p/@pnphoto',
+      contactTelegramId: '@pnphoto_bot',
+      contactTelegramUrl: 'https://t.me/pnphoto_bot',
+      renderLimitDefault: 1200,
+    })
+    expect(put.status).toBe(200)
+    expect(await put.json()).toEqual({
+      contactLineId: '@pnphoto',
+      contactLineUrl: 'https://line.me/R/ti/p/@pnphoto',
+      contactTelegramId: '@pnphoto_bot',
+      contactTelegramUrl: 'https://t.me/pnphoto_bot',
+      renderLimitDefault: 1200,
+    })
+    const get = await (await call('GET', '/admin/settings', admin)).json()
+    expect(get).toMatchObject({ renderLimitDefault: 1200, contactLineId: '@pnphoto' })
+    const contacts = await (await req('/contacts')).json()
+    expect(contacts).toEqual({
+      line: { id: '@pnphoto', url: 'https://line.me/R/ti/p/@pnphoto' },
+      telegram: { id: '@pnphoto_bot', url: 'https://t.me/pnphoto_bot' },
+    })
+  })
+
+  it('PUT /admin/settings rejects a non-https URL and an out-of-range default limit', async () => {
+    const admin = await adminCookie()
+    const base = {
+      contactLineId: '@x',
+      contactLineUrl: 'https://example.com',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://example.com',
+      renderLimitDefault: 100,
+    }
+    const badUrl = await call('PUT', '/admin/settings', admin, {
+      ...base,
+      contactLineUrl: 'http://evil.example',
+    })
+    expect(badUrl.status).toBe(400)
+    const zeroLimit = await call('PUT', '/admin/settings', admin, { ...base, renderLimitDefault: 0 })
+    expect(zeroLimit.status).toBe(400)
+    const hugeLimit = await call('PUT', '/admin/settings', admin, { ...base, renderLimitDefault: 100_001 })
+    expect(hugeLimit.status).toBe(400)
+    // Allowed: empty string drops the channel.
+    const empty = await call('PUT', '/admin/settings', admin, { ...base, contactLineUrl: '' })
+    expect(empty.status).toBe(200)
+  })
+
+  it('non-admin cannot read or write /admin/settings', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'no-admin-settings')
+    expect((await call('GET', '/admin/settings', m.cookie)).status).toBe(401)
+    expect(
+      (await call('PUT', '/admin/settings', m.cookie, {
+        contactLineId: '',
+        contactLineUrl: '',
+        contactTelegramId: '',
+        contactTelegramUrl: '',
+        renderLimitDefault: 500,
+      })).status,
+    ).toBe(401)
+    // Also 401 with NO session at all.
+    expect((await req('/admin/settings')).status).toBe(401)
+    expect(
+      (await req('/admin/settings', {
+        method: 'PUT',
+        body: JSON.stringify({
+          contactLineId: '',
+          contactLineUrl: '',
+          contactTelegramId: '',
+          contactTelegramUrl: '',
+          renderLimitDefault: 500,
+        }),
+      })).status,
+    ).toBe(401)
+  })
+})
+
+describe('admin member renderLimit', () => {
+  beforeEach(async () => {
+    await getDb(env).delete(siteSettings)
+  })
+
+  it('PATCH /admin/members/:id accepts a numeric override and null to clear it', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rl-member')
+    // Default state: override is null, rendersLimit reflects the admin default (600 here).
+    const list1 = (await (await call('GET', `/admin/members?q=${m.token}`, admin)).json()) as AdminMember[]
+    expect(list1[0]).toMatchObject({ renderLimit: null, rendersLimit: 600 })
+
+    const set = await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 50 })
+    expect(set.status).toBe(200)
+    expect(await set.json()).toMatchObject({ renderLimit: 50, rendersLimit: 50 })
+
+    const list2 = (await (await call('GET', `/admin/members?q=${m.token}`, admin)).json()) as AdminMember[]
+    expect(list2[0]).toMatchObject({ renderLimit: 50, rendersLimit: 50 })
+
+    // member's /me reflects the override, too
+    const me = (await (await call('GET', '/me', m.cookie)).json()) as Member
+    expect(me.rendersLimit).toBe(50)
+
+    const clear = await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: null })
+    expect(await clear.json()).toMatchObject({ renderLimit: null, rendersLimit: 600 })
+  })
+
+  it('renderLimit validation rejects 0, 100001 and non-integers', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rl-validation')
+    // (NaN / Infinity are not representable in JSON; JSON.stringify emits `null`, which the
+    // schema accepts as "clear override".) Non-null / non-integer rejection is the guard.
+    for (const bad of [0, -1, 100_001, 1.5, 'x'] as unknown[]) {
+      const res = await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: bad })
+      expect(res.status, `renderLimit=${bad}`).toBe(400)
+    }
+  })
+
+  it('effective limit: member override > admin default > hard-coded 600', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'rl-effective')
+
+    // No settings, no override: falls back to RENDERS_PER_DAY (600).
+    expect(((await (await call('GET', '/me', m.cookie)).json()) as Member).rendersLimit).toBe(600)
+
+    // Set admin default to 42; member without override follows it.
+    await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@x',
+      contactLineUrl: 'https://x.co',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://y.co',
+      renderLimitDefault: 42,
+    })
+    expect(((await (await call('GET', '/me', m.cookie)).json()) as Member).rendersLimit).toBe(42)
+
+    // Member override wins over the default.
+    await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 7 })
+    expect(((await (await call('GET', '/me', m.cookie)).json()) as Member).rendersLimit).toBe(7)
+  })
+})
+
+describe('render limit uses the effective limit', () => {
+  beforeEach(async () => {
+    await getDb(env).delete(siteSettings)
+  })
+
+  const render = (cookie: string, n: number) =>
+    call('POST', '/render/numbers', cookie, {
+      items: Array.from({ length: n }, () => ({ lotteryId: 'dow-jones' })),
+      date: '2026-11-10',
+    })
+
+  it('the admin default caps renders exactly; one over → 429 without consuming', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'eff-default')
+    await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@x',
+      contactLineUrl: 'https://x.co',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://y.co',
+      renderLimitDefault: 5,
+    })
+
+    // Right up to the limit.
+    const ok = await render(m.cookie, 5)
+    expect(ok.status).toBe(200)
+    expect(await ok.json()).toMatchObject({ rendersToday: 5, rendersLimit: 5 })
+    // Over by 1.
+    const over = await render(m.cookie, 1)
+    expect(over.status).toBe(429)
+    // Counter untouched.
+    const db = getDb(env)
+    const row = await db.query.renderCounters.findFirst({
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+    })
+    expect(row?.count).toBe(5)
+  })
+
+  it("a member's own renderLimit overrides the default (both over and at the boundary)", async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'eff-member')
+    await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@x',
+      contactLineUrl: 'https://x.co',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://y.co',
+      renderLimitDefault: 100,
+    })
+    await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 3 })
+
+    expect((await render(m.cookie, 3)).status).toBe(200)
+    // 4th over = refused, counter stuck at 3.
+    expect((await render(m.cookie, 1)).status).toBe(429)
+    const db = getDb(env)
+    const row = await db.query.renderCounters.findFirst({
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+    })
+    expect(row?.count).toBe(3)
+  })
+
+  it('one single request larger than the effective limit is refused up-front', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'eff-large')
+    await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 2 })
+    const res = await render(m.cookie, 10)
+    expect(res.status).toBe(429)
+    // No counter inserted.
+    const db = getDb(env)
+    const row = await db.query.renderCounters.findFirst({
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+    })
+    expect(row).toBeUndefined()
+  })
+
+  it('POST /admin/members/:id/reset-renders resets today to 0 and renders work again', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'reset-renders')
+    await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 3 })
+
+    expect((await render(m.cookie, 3)).status).toBe(200)
+    expect((await render(m.cookie, 1)).status).toBe(429)
+
+    // Seed yesterday too, to prove reset-renders touches today only.
+    const db = getDb(env)
+    await db.insert(renderCounters).values({
+      memberId: m.id,
+      day: utcDay(Date.now() - 86400_000),
+      count: 999,
+    })
+
+    const reset = await call('POST', `/admin/members/${m.id}/reset-renders`, admin)
+    expect(reset.status).toBe(200)
+    const body = (await reset.json()) as AdminMember
+    expect(body).toMatchObject({ id: m.id, rendersToday: 0, renderLimit: 3, rendersLimit: 3 })
+
+    // The reset only touched today; yesterday's row is still there.
+    const yesterday = await db.query.renderCounters.findFirst({
+      where: and(
+        eq(renderCounters.memberId, m.id),
+        eq(renderCounters.day, utcDay(Date.now() - 86400_000)),
+      ),
+    })
+    expect(yesterday?.count).toBe(999)
+
+    // Member can render again, up to the limit.
+    expect((await render(m.cookie, 3)).status).toBe(200)
+  })
+
+  it('reset-renders is 404 on unknown member and 401 without admin session', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'reset-404')
+    expect((await call('POST', '/admin/members/unknown00000001/reset-renders', admin)).status).toBe(404)
+    expect((await call('POST', `/admin/members/${m.id}/reset-renders`, m.cookie)).status).toBe(401)
+    expect(
+      (await req(`/admin/members/${m.id}/reset-renders`, { method: 'POST' })).status,
+    ).toBe(401)
+  })
+
+  it('reset-renders of member A never touches member B', async () => {
+    const admin = await adminCookie()
+    const a = await newMember(admin, 'iso-a')
+    const b = await newMember(admin, 'iso-b')
+    const db = getDb(env)
+    const day = utcDay()
+    await db.insert(renderCounters).values([
+      { memberId: a.id, day, count: 42 },
+      { memberId: b.id, day, count: 77 },
+    ])
+    const res = await call('POST', `/admin/members/${a.id}/reset-renders`, admin)
+    expect(res.status).toBe(200)
+    expect(
+      (
+        await db.query.renderCounters.findFirst({
+          where: and(eq(renderCounters.memberId, a.id), eq(renderCounters.day, day)),
+        })
+      )?.count,
+    ).toBe(0)
+    expect(
+      (
+        await db.query.renderCounters.findFirst({
+          where: and(eq(renderCounters.memberId, b.id), eq(renderCounters.day, day)),
+        })
+      )?.count,
+    ).toBe(77)
+  })
+
+  it('/bootstrap rendersLimit reflects the effective limit', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-limit')
+    await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@x',
+      contactLineUrl: 'https://x.co',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://y.co',
+      renderLimitDefault: 999,
+    })
+    const boot1 = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as {
+      me: Member
+    }
+    expect(boot1.me.rendersLimit).toBe(999)
+    await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 11 })
+    const boot2 = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as {
+      me: Member
+    }
+    expect(boot2.me.rendersLimit).toBe(11)
+  })
+
+  it('inactive /bootstrap also returns the effective limit for /me', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'bootstrap-inactive-limit')
+    await call('PUT', '/admin/settings', admin, {
+      contactLineId: '@x',
+      contactLineUrl: 'https://x.co',
+      contactTelegramId: '@y',
+      contactTelegramUrl: 'https://y.co',
+      renderLimitDefault: 333,
+    })
+    // Flip expired after login so the session + rendersLimit are still readable.
+    await call('PATCH', `/admin/members/${m.id}`, admin, {
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    })
+    const boot = (await (await req('/bootstrap', { cookie: m.cookie })).json()) as {
+      me: Member
+      lotteries?: unknown
+    }
+    expect(boot.me).toMatchObject({ expired: true, rendersLimit: 333 })
+    expect(boot.lotteries).toBeUndefined()
+  })
+})
+
+describe('review: PATCH /sets concurrent writes', () => {
+  it('last-writer-wins across concurrent PATCHes: final state matches one submitted body', async () => {
+    // Guard property: two concurrent PATCHes against the same set MUST produce a final
+    // state that equals one of the two client requests, never a merge-across-snapshots.
+    // The implementation deletes every link and reinserts the full list inside ONE
+    // db.batch, so SQLite's single-writer serialisation makes the two PATCHes run in
+    // some order and the later one overwrites the earlier one.
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'patch-race')
+    const created = (await (
+      await call('POST', '/sets', m.cookie, { name: 'race' })
+    ).json()) as LotterySet
+    // Seed with two ids so both racing PATCHes have a non-empty prior state.
+    await call('PATCH', `/sets/${created.id}`, m.cookie, {
+      lotteryIds: ['hanoi-regular', 'hanoi-vip'],
+    })
+    const A = ['hanoi-regular', 'hanoi-vip', 'dow-jones']
+    const B = ['thai-gov']
+    const [resA, resB] = await Promise.all([
+      call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: A }),
+      call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: B }),
+    ])
+    expect(resA.status).toBe(200)
+    expect(resB.status).toBe(200)
+    // After both commit, the DB state must equal A or B exactly — never a merge.
+    const db = getDb(env)
+    const links = await db
+      .select()
+      .from(setLotteries)
+      .where(eq(setLotteries.setId, created.id))
+      .orderBy(setLotteries.sortOrder)
+    const finalIds = links.map((l) => l.lotteryId)
+    expect([A, B]).toContainEqual(finalIds)
+    // GET /sets agrees with what the DB shows.
+    const sets = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
+    const same = sets.find((s) => s.id === created.id)!
+    expect(same.lotteryIds).toEqual(finalIds)
   })
 })

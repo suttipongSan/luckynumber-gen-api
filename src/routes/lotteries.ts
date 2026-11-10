@@ -1,7 +1,7 @@
 // GET /lotteries — active global catalog + the member's own custom lotteries, sorted by group
 // then sortOrder. POST / PATCH / DELETE operate on the member's own lotteries only.
 import { Hono } from 'hono'
-import { and, asc, eq, isNull, or } from 'drizzle-orm'
+import { and, eq, isNull, or } from 'drizzle-orm'
 import type { AppEnv, Lottery } from '../types'
 import { MAX_CUSTOM_LOTTERIES } from '../types'
 import { getDb } from '../db/client'
@@ -23,6 +23,25 @@ function groupIndex(group: string): number {
   return i === -1 ? GROUP_ORDER.length : i
 }
 
+/**
+ * Sorts lottery rows into the shape GET /lotteries returns: group order first, then sortOrder,
+ * then name. Exported so bootstrap can reuse the identical ordering without a second query.
+ */
+export function sortLotteriesForMember(
+  rows: (typeof lotteries.$inferSelect)[],
+  memberId: string,
+): Lottery[] {
+  const out = rows.map((r) => toLottery(r, memberId))
+  out.sort((a, b) => {
+    const g = groupIndex(a.group) - groupIndex(b.group)
+    if (g !== 0) return g
+    const s = a.sortOrder - b.sortOrder
+    if (s !== 0) return s
+    return a.name.localeCompare(b.name)
+  })
+  return out
+}
+
 lotteryRoutes.get('/lotteries', async (c) => {
   const db = getDb(c.env)
   const memberId = c.get('member').id
@@ -36,15 +55,7 @@ lotteryRoutes.get('/lotteries', async (c) => {
         eq(lotteries.ownerMemberId, memberId),
       ),
     )
-  const out = rows.map((r) => toLottery(r, memberId))
-  out.sort((a, b) => {
-    const g = groupIndex(a.group) - groupIndex(b.group)
-    if (g !== 0) return g
-    const s = a.sortOrder - b.sortOrder
-    if (s !== 0) return s
-    return a.name.localeCompare(b.name)
-  })
-  return c.json(out)
+  return c.json(sortLotteriesForMember(rows, memberId))
 })
 
 lotteryRoutes.post('/lotteries', async (c) => {

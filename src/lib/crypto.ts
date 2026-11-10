@@ -123,16 +123,43 @@ export async function verifyHmacHex(
   return timingSafeEqualStr(expected, sigHex.toLowerCase())
 }
 
-// ---- Signed asset URLs: GET /assets/:id?exp=<unix seconds>&sig=<hex HMAC-SHA256("assetId:exp")>
+// ---- Signed asset URLs
+// URL shape: GET /assets/:id?exp=<unix seconds>&m=<memberId>&e=<ext>&sig=<hex HMAC-SHA256>
+// Signed message: "assetId:memberId:ext:exp"
+//
+// `exp` is rounded UP to the next {@link ASSET_URL_BUCKET_SECONDS} boundary after
+// now + {@link ASSET_URL_MIN_TTL_SECONDS}, so repeat signings of the same id inside one
+// bucket yield the same URL. That lets the browser HTTP cache hit across page reloads and
+// lets the download handler send `Cache-Control: private, max-age=<secondsUntilExp>, immutable`
+// without ever outliving the signature. The member id + extension in the signed payload let
+// the download handler compute the R2 key directly, so no D1 lookup is needed on hit.
+//
+// Tradeoff: a leaked URL — including one issued to a member who was then disabled or whose
+// subscription expired — stays live until exp. Keep the bucket tight enough that this window
+// is bounded by minutes, not hours (today: bucket 30 min + min 10 min = up to 40 min).
+
+/** The signed URL is valid for at LEAST this many seconds beyond the signing time. */
+export const ASSET_URL_MIN_TTL_SECONDS = 600
+/** Exp is quantised to multiples of this (seconds); longer ⇒ better cache reuse, longer leak. */
+export const ASSET_URL_BUCKET_SECONDS = 1800
+/** Upper bound on exp - now that the verifier accepts; matches what the signer can ever emit. */
+export const ASSET_URL_MAX_TTL_SECONDS = ASSET_URL_BUCKET_SECONDS + ASSET_URL_MIN_TTL_SECONDS
+
+function assetMessage(assetId: string, memberId: string, ext: string, exp: number): string {
+  return `${assetId}:${memberId}:${ext}:${exp}`
+}
 
 export async function signAsset(
   secret: string,
   assetId: string,
-  ttlSeconds: number,
+  memberId: string,
+  ext: string,
   nowMs = Date.now(),
 ): Promise<{ exp: number; sig: string }> {
-  const exp = Math.floor(nowMs / 1000) + ttlSeconds
-  const sig = await hmacSha256Hex(secret, `${assetId}:${exp}`)
+  const nowSec = Math.floor(nowMs / 1000)
+  const earliest = nowSec + ASSET_URL_MIN_TTL_SECONDS
+  const exp = Math.ceil(earliest / ASSET_URL_BUCKET_SECONDS) * ASSET_URL_BUCKET_SECONDS
+  const sig = await hmacSha256Hex(secret, assetMessage(assetId, memberId, ext, exp))
   return { exp, sig }
 }
 
@@ -140,11 +167,15 @@ export async function signedAssetUrl(
   baseUrl: string,
   secret: string,
   assetId: string,
-  ttlSeconds: number,
+  memberId: string,
+  ext: string,
   nowMs = Date.now(),
 ): Promise<string> {
-  const { exp, sig } = await signAsset(secret, assetId, ttlSeconds, nowMs)
-  return `${baseUrl.replace(/\/$/, '')}/assets/${encodeURIComponent(assetId)}?exp=${exp}&sig=${sig}`
+  const { exp, sig } = await signAsset(secret, assetId, memberId, ext, nowMs)
+  return (
+    `${baseUrl.replace(/\/$/, '')}/assets/${encodeURIComponent(assetId)}` +
+    `?exp=${exp}&m=${encodeURIComponent(memberId)}&e=${encodeURIComponent(ext)}&sig=${sig}`
+  )
 }
 
 export type AssetSigCheck = 'ok' | 'expired' | 'invalid'
@@ -157,15 +188,21 @@ export async function verifyAssetSignature(
   secret: string,
   assetId: string,
   expRaw: string | undefined | null,
+  memberIdRaw: string | undefined | null,
+  extRaw: string | undefined | null,
   sigRaw: string | undefined | null,
   maxTtlSeconds: number,
   nowMs = Date.now(),
 ): Promise<AssetSigCheck> {
-  if (!expRaw || !sigRaw || !/^\d{1,12}$/.test(expRaw) || !/^[0-9a-fA-F]{64}$/.test(sigRaw)) {
-    return 'invalid'
-  }
+  if (!expRaw || !sigRaw || !memberIdRaw || !extRaw) return 'invalid'
+  if (!/^\d{1,12}$/.test(expRaw) || !/^[0-9a-fA-F]{64}$/.test(sigRaw)) return 'invalid'
+  // Tight whitelist for member id (same charset as newId / newToken) and extension (matches
+  // the `EXT_BY_TYPE` values in routes/assets.ts). Anything else is rejected before the HMAC
+  // compare so forged memberId / ext values never reach r2KeyFor.
+  if (!/^[0-9A-Za-z]{1,32}$/.test(memberIdRaw)) return 'invalid'
+  if (!/^[a-z0-9]{1,8}$/.test(extRaw)) return 'invalid'
   const exp = Number(expRaw)
-  const valid = await verifyHmacHex(secret, `${assetId}:${exp}`, sigRaw)
+  const valid = await verifyHmacHex(secret, assetMessage(assetId, memberIdRaw, extRaw, exp), sigRaw)
   if (!valid) return 'invalid'
   const now = Math.floor(nowMs / 1000)
   if (exp < now) return 'expired'

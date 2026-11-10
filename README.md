@@ -20,8 +20,9 @@ src/lib/session.ts      ng_session / ng_admin cookies (signed id + DB row, 24 h,
 src/lib/numbers.ts      number generation (port of the mockup's lib/numbers.ts)
 src/lib/ids.ts          16-char base62 ids, 32-char tokens
 src/lib/loginLimiter.ts 5 wrong passwords → 429 for 15 min (login_attempts table)
+src/lib/siteSettings.ts site_settings key whitelist, compiled-in defaults, effective-limit helpers
 src/middleware/         memberAuth (session + expiry/disabled check on every call), adminAuth
-src/routes/             link, me, lotteries, news, sets, settings, render, assets, admin
+src/routes/             link, me, bootstrap, contacts, lotteries, news, sets, settings, render, assets, admin
 drizzle/                generated SQL migrations
 scripts/                seed-sql (writes seed.sql for D1), hash-password, db (test helpers)
 test/                   vitest: numbers, crypto/signed URLs, app (app.request + file:test.db + fake R2)
@@ -76,7 +77,7 @@ Live on the operator's Cloudflare account (all free plan):
 
 | Piece | Resource |
 |---|---|
-| Worker | `numbergen-api` → https://api.pnphoto.co (also https://numbergen-api.luckynumbertech.workers.dev) |
+| Worker | `numbergen-api` → https://api.pnphoto.co |
 | Database | D1 `numbergen` (binding `DB`, APAC) |
 | Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private) |
 | Web origin | `WEB_URL` in wrangler.toml → https://pnphoto.co (comma-separated list; first one is used in member links) |
@@ -86,7 +87,7 @@ Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASS
 
 ```powershell
 npm run db:migrate:remote   # after adding a migration
-npm run deploy              # wrangler deploy
+npm run deploy              # runs db:migrate:remote first (predeploy), then wrangler deploy
 ```
 
 D1 free-plan limits the code respects: at most 100 bound parameters per statement and 50 statements
@@ -105,8 +106,16 @@ multi-row inserts.
   across all Worker isolates. A password reset or member delete clears the link's counter.
 - **Default set**: a partial unique index (`sets_one_default_idx`) allows one Default set per member, so two
   concurrent first `GET /sets` calls cannot create two.
-- **Render limit**: each `POST /render/numbers` call counts `items.length` renders against 600 per UTC
-  day (`render_counters`). The counter is incremented atomically first and rolled back when it goes over the limit.
+- **Render limit**: each `POST /render/numbers` call counts `items.length` renders against the
+  per-member daily cap, computed as `members.render_limit ?? site_settings.render_limit_default
+  ?? RENDERS_PER_DAY (600)`. The counter is incremented atomically in a single upsert whose
+  `setWhere` checks the effective limit (bound as a parameter); an over-limit request is a
+  SQLite no-op (no row modified → `changes() = 0`) and the guarded `members.renders_total`
+  update is skipped. The limit is read in the same read batch as the lottery/settings/assets
+  queries (one D1 round trip, no extra sequential hop on the hot path). Admin overrides are
+  set via `PATCH /admin/members/:id { renderLimit: int | null }`; the back-office default is
+  set via `PUT /admin/settings { renderLimitDefault }`. A rescue op is available at
+  `POST /admin/members/:id/reset-renders` (resets today's counter to 0).
 - **CSRF**: on top of CORS, any non-GET request that carries an `Origin` header outside the allow-list is
   rejected with 403. Multipart uploads are "simple" requests and skip the CORS preflight, which is why this check exists.
 - **Assets**: png, jpg, webp, gif and avif up to 5 MB, 2 per kind per member. SVG is refused. Kinds are
@@ -114,6 +123,11 @@ multi-row inserts.
   and `qr.assetId` in that member's saved settings.
 - **Member delete** removes the member's sets, settings, assets (DB rows and R2 objects), news reads,
   render counters, sessions and v2 custom lotteries (and the set_lotteries / card_settings rows for them).
+- **Site settings** (admin-editable): `site_settings(key, value, updated_at)` stores contact info
+  shown on the lock / renew / no-session screens (Line + Telegram id and URL) and the default
+  daily render limit. GET/PUT are at `/admin/settings`; public `GET /contacts` exposes just the
+  two channel objects (null when the id is empty) with `Cache-Control: public, max-age=60`.
+  Every key has a compiled-in default (`src/lib/siteSettings.ts`) so a fresh DB keeps working.
 
 ## v2 additions (2026-11-07)
 

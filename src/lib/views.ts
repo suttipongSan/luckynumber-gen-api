@@ -2,8 +2,8 @@
 import { and, eq, inArray, isNull, or } from 'drizzle-orm'
 import type { DB } from '../db/client'
 import { lotteries, renderCounters, type members } from '../db/schema'
-import type { AdminMember, Group, Lottery, Member } from '../types'
-import { RENDERS_PER_DAY } from '../types'
+import type { AdminMember, Group, Lottery, Member, SessionMember } from '../types'
+import { effectiveRenderLimit } from './siteSettings'
 import { isExpired, utcDay } from './time'
 import { chunk, IN_CHUNK } from './chunk'
 
@@ -28,7 +28,11 @@ export function toLottery(r: LotteryRow, memberId?: string): Lottery {
   }
 }
 
-export function toMember(r: MemberRow, rendersToday: number): Member {
+export function toMember(
+  r: SessionMember | MemberRow,
+  rendersToday: number,
+  defaultRenderLimit: number,
+): Member {
   return {
     id: r.id,
     displayName: r.displayName,
@@ -36,7 +40,7 @@ export function toMember(r: MemberRow, rendersToday: number): Member {
     expired: isExpired(r.expiresAt),
     disabled: r.disabled,
     rendersToday,
-    rendersLimit: RENDERS_PER_DAY,
+    rendersLimit: effectiveRenderLimit(r.renderLimit, defaultRenderLimit),
   }
 }
 
@@ -46,15 +50,21 @@ export function memberLink(webUrl: string, linkToken: string): string {
   return `${primary}/m/${linkToken}`
 }
 
-export function toAdminMember(r: MemberRow, rendersToday: number, webUrl: string): AdminMember {
+export function toAdminMember(
+  r: MemberRow,
+  rendersToday: number,
+  webUrl: string,
+  defaultRenderLimit: number,
+): AdminMember {
   return {
-    ...toMember(r, rendersToday),
+    ...toMember(r, rendersToday, defaultRenderLimit),
     linkToken: r.linkToken,
     link: memberLink(webUrl, r.linkToken),
     hasPassword: r.passwordHash !== null,
     lastLoginAt: r.lastLoginAt,
     createdAt: r.createdAt,
     rendersTotal: r.rendersTotal,
+    renderLimit: r.renderLimit,
   }
 }
 

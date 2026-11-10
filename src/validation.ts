@@ -181,10 +181,38 @@ export const createMemberSchema = z.object({
   expiresAt: isoDate,
 })
 
+/**
+ * Admin override of a member's daily render limit. `null` clears the override (falls back
+ * to the admin-configured default). Finite integer 1..100000 otherwise.
+ */
+const memberRenderLimit = z
+  .union([z.number().int().min(1).max(100_000), z.null()])
+
 export const patchMemberSchema = z.object({
   displayName: z.string().trim().min(1).max(60).optional(),
   expiresAt: isoDate.optional(),
   disabled: z.boolean().optional(),
+  renderLimit: memberRenderLimit.optional(),
+})
+
+// Admin GET/PUT /admin/settings.
+// - Contact ids: up to 60 chars, trimmed. Empty string = "hide this channel" on the public
+//   /contacts endpoint (web then drops the button).
+// - Contact URLs: either empty OR https://… (max 500 chars). Empty keeps the channel hidden.
+// - renderLimitDefault: integer 1..100000.
+const contactId = z.string().trim().max(60)
+const contactUrl = z
+  .string()
+  .trim()
+  .max(500)
+  .refine((v) => v === '' || v.startsWith('https://'), 'url ต้องเริ่มด้วย https://')
+
+export const adminSettingsSchema = z.object({
+  contactLineId: contactId,
+  contactLineUrl: contactUrl,
+  contactTelegramId: contactId,
+  contactTelegramUrl: contactUrl,
+  renderLimitDefault: z.number().int().min(1).max(100_000),
 })
 
 export const lotterySchema = z.object({

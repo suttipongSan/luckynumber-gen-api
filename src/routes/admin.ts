@@ -1,11 +1,13 @@
 // Back office API (operator). Cookie `ng_admin`; everything except login/logout requires it.
 import { Hono } from 'hono'
-import { and, asc, desc, eq, inArray, isNull, like, or } from 'drizzle-orm'
-import type { AdminNews, AppEnv } from '../types'
+import { and, asc, desc, eq, inArray, isNull, like, lt, or, sql } from 'drizzle-orm'
+import type { AdminNews, AdminSettings, AppEnv } from '../types'
 import { getDb, type DB } from '../db/client'
 import {
+  adminSessions,
   assets,
   cardSettings,
+  loginAttempts,
   lotteries,
   memberSessions,
   members,
@@ -14,17 +16,34 @@ import {
   renderCounters,
   setLotteries,
   sets,
+  siteSettings,
 } from '../db/schema'
 import { requireAdmin } from '../middleware/adminAuth'
 import { errors, parseJson } from '../lib/http'
 import { timingSafeEqualStr, verifyPassword } from '../lib/crypto'
-import { endAdminSession, startAdminSession } from '../lib/session'
+import {
+  endAdminSession,
+  finishAdminSession,
+  newAdminSessionRow,
+} from '../lib/session'
 import { adminKey, clearFailures, linkKey, lockRemaining, recordFailure } from '../lib/loginLimiter'
 import { newId, newToken } from '../lib/ids'
-import { nowIso, toIso } from '../lib/time'
+import {
+  CONTACT_LINE_ID,
+  CONTACT_LINE_URL,
+  CONTACT_TELEGRAM_ID,
+  CONTACT_TELEGRAM_URL,
+  DEFAULTS,
+  getSiteSettings,
+  parseDefaultRenderLimit,
+  RENDER_LIMIT_DEFAULT,
+  type SiteSettingKey,
+} from '../lib/siteSettings'
+import { nowIso, toIso, utcDay } from '../lib/time'
 import { rendersTodayFor, rendersTodayMap, toAdminMember, toLottery } from '../lib/views'
 import {
   adminLoginSchema,
+  adminSettingsSchema,
   createMemberSchema,
   lotterySchema,
   newsSchema,
@@ -57,8 +76,16 @@ adminRoutes.post('/login', async (c) => {
     if (await recordFailure(db, key)) throw lockedError(await lockRemaining(db, key))
     throw errors.unauthenticated('ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง')
   }
-  await clearFailures(db, key)
-  await startAdminSession(c)
+  const session = newAdminSessionRow()
+  // Independent writes in one round trip: session insert, lockout reset, and expired admin
+  // session cleanup (the admin_sessions table is tiny so the full scan is fine). Lockout
+  // semantics unchanged.
+  await db.batch([
+    db.insert(adminSessions).values(session),
+    db.delete(adminSessions).where(lt(adminSessions.expiresAt, nowIso())),
+    db.delete(loginAttempts).where(eq(loginAttempts.key, key)),
+  ])
+  await finishAdminSession(c, session.id)
   return c.body(null, 204)
 })
 
@@ -73,10 +100,18 @@ adminRoutes.get('/me', (c) => c.json({ username: c.get('adminUser') }))
 
 // ---- members
 
-async function adminMember(db: DB, id: string, webUrl: string) {
+/** Reads the admin-configured default render limit; returns RENDERS_PER_DAY on fallback. */
+async function readDefaultRenderLimit(db: DB): Promise<number> {
+  const row = await db.query.siteSettings.findFirst({
+    where: eq(siteSettings.key, RENDER_LIMIT_DEFAULT),
+  })
+  return parseDefaultRenderLimit(row?.value ?? DEFAULTS[RENDER_LIMIT_DEFAULT])
+}
+
+async function adminMember(db: DB, id: string, webUrl: string, defaultLimit: number) {
   const row = await db.query.members.findFirst({ where: eq(members.id, id) })
   if (!row) throw errors.notFound('ไม่พบสมาชิก')
-  return toAdminMember(row, await rendersTodayFor(db, id), webUrl)
+  return toAdminMember(row, await rendersTodayFor(db, id), webUrl, defaultLimit)
 }
 
 adminRoutes.get('/members', async (c) => {
@@ -88,11 +123,16 @@ adminRoutes.get('/members', async (c) => {
     .from(members)
     .where(q ? or(like(members.displayName, pattern), like(members.linkToken, pattern)) : undefined)
     .orderBy(desc(members.createdAt))
-  const today = await rendersTodayMap(
-    db,
-    rows.map((r) => r.id),
+  const [today, defaultLimit] = await Promise.all([
+    rendersTodayMap(
+      db,
+      rows.map((r) => r.id),
+    ),
+    readDefaultRenderLimit(db),
+  ])
+  return c.json(
+    rows.map((r) => toAdminMember(r, today.get(r.id) ?? 0, c.env.WEB_URL, defaultLimit)),
   )
-  return c.json(rows.map((r) => toAdminMember(r, today.get(r.id) ?? 0, c.env.WEB_URL)))
 })
 
 adminRoutes.post('/members', async (c) => {
@@ -108,9 +148,11 @@ adminRoutes.post('/members', async (c) => {
     lastLoginAt: null,
     createdAt: nowIso(),
     rendersTotal: 0,
+    renderLimit: null,
   }
   await db.insert(members).values(row)
-  return c.json(toAdminMember(row, 0, c.env.WEB_URL))
+  const defaultLimit = await readDefaultRenderLimit(db)
+  return c.json(toAdminMember(row, 0, c.env.WEB_URL, defaultLimit))
 })
 
 adminRoutes.patch('/members/:id', async (c) => {
@@ -121,6 +163,8 @@ adminRoutes.patch('/members/:id', async (c) => {
   if (body.displayName !== undefined) patch.displayName = body.displayName
   if (body.expiresAt !== undefined) patch.expiresAt = toIso(body.expiresAt)
   if (body.disabled !== undefined) patch.disabled = body.disabled
+  // `renderLimit: null` in the body means "clear override, fall back to the default".
+  if (body.renderLimit !== undefined) patch.renderLimit = body.renderLimit
   if (Object.keys(patch).length) {
     const updated = await db
       .update(members)
@@ -129,7 +173,8 @@ adminRoutes.patch('/members/:id', async (c) => {
       .returning({ id: members.id })
     if (updated.length === 0) throw errors.notFound('ไม่พบสมาชิก')
   }
-  return c.json(await adminMember(db, id, c.env.WEB_URL))
+  const defaultLimit = await readDefaultRenderLimit(db)
+  return c.json(await adminMember(db, id, c.env.WEB_URL, defaultLimit))
 })
 
 adminRoutes.post('/members/:id/reset-password', async (c) => {
@@ -143,6 +188,30 @@ adminRoutes.post('/members/:id/reset-password', async (c) => {
   ])
   await clearFailures(db, linkKey(row.linkToken))
   return c.body(null, 204)
+})
+
+/**
+ * Resets today's (UTC) render counter for this member to 0, so they can keep using the
+ * app after hitting the daily limit. Returns the updated AdminMember so the UI can refresh
+ * the "สุ่มวันนี้" column without a second request.
+ */
+adminRoutes.post('/members/:id/reset-renders', async (c) => {
+  const db = getDb(c.env)
+  const id = c.req.param('id')
+  const row = await db.query.members.findFirst({ where: eq(members.id, id) })
+  if (!row) throw errors.notFound('ไม่พบสมาชิก')
+  const day = utcDay()
+  // Upsert → the counter is always 0 for today afterwards, whether or not it existed.
+  // Tests expect this ONE-ROW overwrite not to touch yesterday or other members.
+  await db
+    .insert(renderCounters)
+    .values({ memberId: id, day, count: 0 })
+    .onConflictDoUpdate({
+      target: [renderCounters.memberId, renderCounters.day],
+      set: { count: 0 },
+    })
+  const defaultLimit = await readDefaultRenderLimit(db)
+  return c.json(await adminMember(db, id, c.env.WEB_URL, defaultLimit))
 })
 
 adminRoutes.delete('/members/:id', async (c) => {
@@ -304,4 +373,49 @@ adminRoutes.delete('/news/:id', async (c) => {
     db.delete(news).where(eq(news.id, id)),
   ])
   return c.body(null, 204)
+})
+
+// ---- settings (contact info + default render limit)
+
+function toAdminSettings(map: Record<string, string>): AdminSettings {
+  return {
+    contactLineId: map[CONTACT_LINE_ID] ?? '',
+    contactLineUrl: map[CONTACT_LINE_URL] ?? '',
+    contactTelegramId: map[CONTACT_TELEGRAM_ID] ?? '',
+    contactTelegramUrl: map[CONTACT_TELEGRAM_URL] ?? '',
+    renderLimitDefault: parseDefaultRenderLimit(map[RENDER_LIMIT_DEFAULT]),
+  }
+}
+
+adminRoutes.get('/settings', async (c) => {
+  const db = getDb(c.env)
+  const map = await getSiteSettings(db)
+  return c.json(toAdminSettings(map))
+})
+
+adminRoutes.put('/settings', async (c) => {
+  const db = getDb(c.env)
+  const body = await parseJson(c, adminSettingsSchema)
+  const updatedAt = nowIso()
+  const rows: { key: SiteSettingKey; value: string; updatedAt: string }[] = [
+    { key: CONTACT_LINE_ID, value: body.contactLineId, updatedAt },
+    { key: CONTACT_LINE_URL, value: body.contactLineUrl, updatedAt },
+    { key: CONTACT_TELEGRAM_ID, value: body.contactTelegramId, updatedAt },
+    { key: CONTACT_TELEGRAM_URL, value: body.contactTelegramUrl, updatedAt },
+    { key: RENDER_LIMIT_DEFAULT, value: String(body.renderLimitDefault), updatedAt },
+  ]
+  // Single multi-row upsert: 5 rows × 3 params = 15 bound params, well under the 100-cap
+  // and 50-stmt-per-request limits. Keeping it atomic avoids half-persisted settings.
+  await db
+    .insert(siteSettings)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: [siteSettings.key],
+      set: {
+        value: sql`excluded.value`,
+        updatedAt: sql`excluded.updated_at`,
+      },
+    })
+  const map = await getSiteSettings(db)
+  return c.json(toAdminSettings(map))
 })

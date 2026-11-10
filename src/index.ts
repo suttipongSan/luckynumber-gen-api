@@ -6,6 +6,8 @@ import { API_VERSION } from './types'
 import { ApiError, errorJson, errors } from './lib/http'
 import { linkRoutes } from './routes/link'
 import { meRoutes } from './routes/me'
+import { bootstrapRoutes } from './routes/bootstrap'
+import { contactsRoutes } from './routes/contacts'
 import { lotteryRoutes } from './routes/lotteries'
 import { newsRoutes } from './routes/news'
 import { setRoutes } from './routes/sets'
@@ -37,7 +39,8 @@ app.use('*', async (c, next) => {
     credentials: true,
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowHeaders: ['Content-Type'],
-    maxAge: 600,
+    // 2 h is the current Chrome cap for CORS preflight caching; Firefox allows up to 24 h.
+    maxAge: 7200,
   })(c, next)
 })
 
@@ -58,6 +61,8 @@ app.get('/health', (c) => c.json({ ok: true, version: API_VERSION }))
 
 app.route('/', linkRoutes)
 app.route('/', meRoutes)
+app.route('/', bootstrapRoutes)
+app.route('/', contactsRoutes)
 app.route('/', lotteryRoutes)
 app.route('/', newsRoutes)
 app.route('/', setRoutes)

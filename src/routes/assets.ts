@@ -1,7 +1,10 @@
-// Per-member asset library (backgrounds / logos) stored in R2, served only via signed URLs.
+// Per-member asset library (backgrounds / logos / QR) stored in R2, served only via signed
+// URLs. The signature embeds the member id and extension so the download path needs no D1
+// lookup; the URL is bucketed to a 30-min boundary so the browser cache reuses the response.
 import { Hono } from 'hono'
-import { and, asc, eq } from 'drizzle-orm'
-import type { AppEnv, Asset, AssetKind, CardSettings } from '../types'
+import { and, asc, eq, sql } from 'drizzle-orm'
+import type { BatchItem } from 'drizzle-orm/batch'
+import type { AppEnv, Asset, AssetKind } from '../types'
 import { ASSET_URL_TTL_SECONDS, MAX_ASSETS_PER_KIND, MAX_ASSET_BYTES } from '../types'
 import { getDb, type DB } from '../db/client'
 import { assets, cardSettings } from '../db/schema'
@@ -13,6 +16,8 @@ import { nowIso } from '../lib/time'
 const KIND_LABEL_TH: Record<AssetKind, string> = { background: 'พื้นหลัง', logo: 'โลโก้', qr: 'QR code' }
 import { signedAssetUrl, verifyAssetSignature } from '../lib/crypto'
 import { apiOrigin } from './render'
+
+type BatchSqlite = BatchItem<'sqlite'>
 
 export const assetRoutes = new Hono<AppEnv>()
 
@@ -42,36 +47,14 @@ export function r2KeyFor(memberId: string, assetId: string, ext: string): string
   return `members/${memberId}/assets/${assetId}.${ext}`
 }
 
-/** Removes references to `assetId` from the member's saved card settings. */
-export async function clearAssetRefs(db: DB, memberId: string, assetId: string): Promise<void> {
-  const rows = await db.select().from(cardSettings).where(eq(cardSettings.memberId, memberId))
-  for (const r of rows) {
-    let s: CardSettings
-    try {
-      s = JSON.parse(r.settingsJson) as CardSettings
-    } catch {
-      continue
-    }
-    let changed = false
-    if (s.backgroundAssetId === assetId) {
-      s.backgroundAssetId = null
-      changed = true
-    }
-    if (s.logo && s.logo.assetId === assetId) {
-      s.logo = { ...s.logo, assetId: null }
-      changed = true
-    }
-    if (s.qr && s.qr.assetId === assetId) {
-      s.qr = { ...s.qr, assetId: null }
-      changed = true
-    }
-    if (changed) {
-      await db
-        .update(cardSettings)
-        .set({ settingsJson: JSON.stringify(s), updatedAt: nowIso() })
-        .where(and(eq(cardSettings.memberId, memberId), eq(cardSettings.lotteryId, r.lotteryId)))
-    }
-  }
+/**
+ * The extension suffix of a stored r2 key. The signer embeds this in the signed URL so the
+ * download handler can rebuild the key without a D1 read. Upload validates the content type
+ * before building the key, so this is always one of {@link EXT_BY_TYPE}'s values.
+ */
+export function extFromR2Key(r2Key: string): string {
+  const dot = r2Key.lastIndexOf('.')
+  return dot < 0 ? '' : r2Key.slice(dot + 1)
 }
 
 async function ownedAsset(db: DB, memberId: string, id: string): Promise<AssetRow> {
@@ -87,25 +70,38 @@ assetRoutes.get('/assets/:id', async (c, next) => {
   const id = c.req.param('id')
   const exp = c.req.query('exp')
   const sig = c.req.query('sig')
+  const memberId = c.req.query('m')
+  const ext = c.req.query('e')
+  // Fall through to the authenticated route when nothing identifying a signed request is
+  // present (keeps the previous "unsigned → 403" shape for anyone hitting the raw path).
   if (exp === undefined && sig === undefined) return next()
   const check = await verifyAssetSignature(
     c.env.ASSET_SIGNING_SECRET,
     id,
     exp,
+    memberId,
+    ext,
     sig,
     ASSET_URL_TTL_SECONDS,
   )
   if (check === 'expired') throw errors.forbidden('ลิงก์รูปหมดอายุ')
   if (check !== 'ok') throw errors.forbidden('ลิงก์รูปไม่ถูกต้อง')
-  const row = await getDb(c.env).query.assets.findFirst({ where: eq(assets.id, id) })
-  if (!row) throw errors.notFound('ไม่พบไฟล์')
-  const obj = await c.env.ASSETS.get(row.r2Key)
+  // memberId and ext are HMAC-authenticated at this point, so rebuilding the R2 key from them
+  // is safe (and avoids the D1 row read).
+  const r2Key = r2KeyFor(memberId as string, id, ext as string)
+  const obj = await c.env.ASSETS.get(r2Key)
   if (!obj) throw errors.notFound('ไม่พบไฟล์')
+  const now = Math.floor(Date.now() / 1000)
+  const maxAge = Math.max(0, Number(exp) - now)
+  const contentType = obj.httpMetadata?.contentType || 'application/octet-stream'
   return new Response(obj.body, {
     status: 200,
     headers: {
-      'Content-Type': row.contentType,
-      'Cache-Control': 'private, max-age=600',
+      'Content-Type': contentType,
+      // Asset bytes are immutable per id, and `exp` is bucketed so the same URL points at the
+      // same bytes until it expires: the browser may reuse the cached response without
+      // revalidating.
+      'Cache-Control': `private, max-age=${maxAge}, immutable`,
       'X-Content-Type-Options': 'nosniff',
       // Defence in depth: the bytes are only ever used as an <img>, never as a document.
       'Content-Security-Policy': "default-src 'none'; sandbox",
@@ -115,13 +111,46 @@ assetRoutes.get('/assets/:id', async (c, next) => {
   })
 })
 
+/**
+ * Builds the GET /assets response from preloaded rows (used by GET /assets and by /bootstrap
+ * so bootstrap does not need a second query). Signs every row with the same bucketed exp
+ * logic as a direct GET /assets call. At most MAX_ASSETS_PER_KIND × 3 kinds = 6 HMACs with a
+ * cached CryptoKey.
+ */
+export async function buildAssetsResponse(
+  origin: string,
+  secret: string,
+  memberId: string,
+  rows: AssetRow[],
+): Promise<Asset[]> {
+  const out: Asset[] = []
+  for (const r of rows) {
+    const ext = extFromR2Key(r.r2Key)
+    const base = toAsset(r)
+    if (!ext) {
+      out.push(base)
+      continue
+    }
+    const url = await signedAssetUrl(origin, secret, r.id, memberId, ext)
+    out.push({ ...base, url })
+  }
+  return out
+}
+
 assetRoutes.get('/assets', requireMember(), async (c) => {
+  const member = c.get('member')
   const rows = await getDb(c.env)
     .select()
     .from(assets)
-    .where(eq(assets.memberId, c.get('member').id))
+    .where(eq(assets.memberId, member.id))
     .orderBy(asc(assets.createdAt))
-  return c.json(rows.map(toAsset))
+  const out = await buildAssetsResponse(
+    apiOrigin(c.req.url),
+    c.env.ASSET_SIGNING_SECRET,
+    member.id,
+    rows,
+  )
+  return c.json(out)
 })
 
 assetRoutes.post('/assets', requireMember(), async (c) => {
@@ -150,12 +179,12 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
   if (file.size === 0) throw errors.validation('ไฟล์ว่างเปล่า')
   if (file.size > MAX_ASSET_BYTES) throw errors.validation('ไฟล์ต้องมีขนาดไม่เกิน 5 MB')
 
-  const count = (
-    await db
-      .select({ id: assets.id })
-      .from(assets)
-      .where(and(eq(assets.memberId, memberId), eq(assets.kind, kind)))
-  ).length
+  // count(*) rather than selecting ids: one scalar instead of up to MAX_ASSETS_PER_KIND rows.
+  const [countRow] = await db
+    .select({ c: sql<number>`count(*)` })
+    .from(assets)
+    .where(and(eq(assets.memberId, memberId), eq(assets.kind, kind)))
+  const count = Number(countRow?.c ?? 0)
   if (count >= MAX_ASSETS_PER_KIND) {
     throw errors.conflict('QUOTA', `${KIND_LABEL_TH[kind]} เก็บได้สูงสุด ${MAX_ASSETS_PER_KIND} ไฟล์ ลบไฟล์เดิมก่อนอัปโหลดใหม่`)
   }
@@ -186,21 +215,63 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
 assetRoutes.delete('/assets/:id', requireMember(), async (c) => {
   const db = getDb(c.env)
   const memberId = c.get('member').id
-  const row = await ownedAsset(db, memberId, c.req.param('id'))
+  const assetId = c.req.param('id')
+  const updatedAt = nowIso()
+
+  // Ownership + r2Key in one PK read; also serves as the 404 shortcut.
+  const row = await ownedAsset(db, memberId, assetId)
+
+  // R2 delete first: if it throws, the D1 row is untouched so the member can retry. Doing
+  // the D1 batch first would risk a successful D1 commit followed by an R2 failure, which
+  // orphans the R2 object for up to the signed-URL TTL (the download handler no longer
+  // reads D1) and leaves no table row from which the admin member-delete can find the key.
   await c.env.ASSETS.delete(row.r2Key)
-  await db.delete(assets).where(eq(assets.id, row.id))
-  await clearAssetRefs(db, memberId, row.id)
+
+  // One D1 batch (4 statements) clears every reference set-based in SQL and removes the
+  // assets row atomically once the R2 object is gone.
+  //
+  // The WHERE predicate uses a CASE so a row with malformed JSON is skipped rather than
+  // raising from `json_extract` (SQLite does not guarantee AND short-circuits left-to-right).
+  // `json_set(..., json('null'))` writes JSON null, matching what the old JS code wrote.
+  const clearRef = (path: string): BatchSqlite =>
+    db
+      .update(cardSettings)
+      .set({
+        settingsJson: sql`json_set(${cardSettings.settingsJson}, ${path}, json('null'))`,
+        updatedAt,
+      })
+      .where(
+        and(
+          eq(cardSettings.memberId, memberId),
+          sql`(CASE WHEN json_valid(${cardSettings.settingsJson}) THEN json_extract(${cardSettings.settingsJson}, ${path}) END) = ${assetId}`,
+        ),
+      ) as unknown as BatchSqlite
+
+  const deleteStmt = db
+    .delete(assets)
+    .where(and(eq(assets.id, assetId), eq(assets.memberId, memberId))) as unknown as BatchSqlite
+
+  await db.batch([
+    deleteStmt,
+    clearRef('$.backgroundAssetId'),
+    clearRef('$.logo.assetId'),
+    clearRef('$.qr.assetId'),
+  ] as [BatchSqlite, BatchSqlite, BatchSqlite, BatchSqlite])
+
   return c.body(null, 204)
 })
 
 assetRoutes.get('/assets/:id/url', requireMember(), async (c) => {
   const db = getDb(c.env)
-  const row = await ownedAsset(db, c.get('member').id, c.req.param('id'))
+  const member = c.get('member')
+  const row = await ownedAsset(db, member.id, c.req.param('id'))
+  const ext = extFromR2Key(row.r2Key)
   const url = await signedAssetUrl(
     apiOrigin(c.req.url),
     c.env.ASSET_SIGNING_SECRET,
     row.id,
-    ASSET_URL_TTL_SECONDS,
+    member.id,
+    ext,
   )
   return c.json({ url })
 })

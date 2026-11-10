@@ -34,6 +34,8 @@ export interface AdminMember extends Member {
   lastLoginAt: string | null
   createdAt: string
   rendersTotal: number
+  /** Per-member daily render override (null = use the admin-configured default). */
+  renderLimit: number | null
 }
 
 export interface LotterySet {
@@ -54,6 +56,11 @@ export interface Asset {
   contentType: string
   sizeBytes: number
   createdAt: string
+  /**
+   * Short-lived signed download URL. Present on `GET /assets` (so the web app can render
+   * thumbnails without a `GET /assets/:id/url` round trip per asset); absent elsewhere.
+   */
+  url?: string
 }
 
 /**
@@ -122,6 +129,29 @@ export interface News {
   publishedAt: string
 }
 
+/** Public GET /contacts response. A channel is `null` when its id or URL is blank. */
+export interface ContactChannel {
+  id: string
+  url: string
+}
+export interface ContactsResponse {
+  line: ContactChannel | null
+  telegram: ContactChannel | null
+}
+
+/**
+ * Admin GET/PUT /admin/settings. Empty strings for contact id/url mean "hide this channel"
+ * (GET /contacts returns null for a channel whose id or URL is empty). `renderLimitDefault` is an
+ * integer 1..100000.
+ */
+export interface AdminSettings {
+  contactLineId: string
+  contactLineUrl: string
+  contactTelegramId: string
+  contactTelegramUrl: string
+  renderLimitDefault: number
+}
+
 export interface AdminNews extends News {
   active: boolean
 }
@@ -170,10 +200,26 @@ export interface MemberRow {
   lastLoginAt: string | null
   createdAt: string
   rendersTotal: number
+  renderLimit: number | null
+}
+
+/**
+ * The subset of member columns the auth middleware loads for every request and that handlers
+ * may read via `c.get('member')`. Must NOT include passwordHash / linkToken / lastLoginAt /
+ * createdAt / rendersTotal: handlers only need the id (plus expiry/disabled for toMember).
+ * `renderLimit` is included so render.ts / me.ts / bootstrap.ts can compute the effective
+ * daily cap without a second query (the auth JOIN already reads the members row).
+ */
+export interface SessionMember {
+  id: string
+  displayName: string
+  expiresAt: string
+  disabled: boolean
+  renderLimit: number | null
 }
 
 export interface Variables {
-  member: MemberRow
+  member: SessionMember
   adminUser: string
 }
 
@@ -191,6 +237,12 @@ export const MAX_CUSTOM_LOTTERIES = 30
 export const MIN_ROUND = 1
 export const MAX_ROUND = 20
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024
-export const ASSET_URL_TTL_SECONDS = 600
+/**
+ * Verifier ceiling: the download handler refuses exp values further in the future than this
+ * (plus 60 s slack). Signed URLs are bucketed to the next
+ * `ASSET_URL_BUCKET_SECONDS` boundary after `now + ASSET_URL_MIN_TTL_SECONDS`, so this cap
+ * is bucket + min-ttl (see src/lib/crypto.ts). Today: 1800 s bucket + 600 s min = 2400 s max.
+ */
+export const ASSET_URL_TTL_SECONDS = 2400
 export const SESSION_TTL_SECONDS = 24 * 60 * 60
 export const API_VERSION = '0.1.0'
