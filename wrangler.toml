@@ -3,10 +3,15 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Custom domain (zone pnphoto.co in the naskmill8 Cloudflare account).
+routes = [{ pattern = "api.pnphoto.co", custom_domain = true }]
+workers_dev = true
+
 # Non-secret configuration. For local dev, .dev.vars overrides these values.
 # Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
 [vars]
-WEB_URL = "https://numbergen-web.luckynumbertech.workers.dev"
+# First origin is used in member links; every listed origin is allowed by CORS.
+WEB_URL = "https://pnphoto.co,https://numbergen-web.luckynumbertech.workers.dev"
 COOKIE_SECURE = "true"
 
 # Cloudflare D1 (SQLite). Migrations are the drizzle-kit SQL files in drizzle/:

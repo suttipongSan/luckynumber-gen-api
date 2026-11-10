@@ -16,10 +16,16 @@ import { adminRoutes } from './routes/admin'
 
 const DEV_ORIGIN = 'http://localhost:5173'
 
+/** WEB_URL may list several origins separated by commas; the first one is used in member links. */
+export function webOrigins(webUrl: string | undefined): string[] {
+  return (webUrl ?? '')
+    .split(',')
+    .map((u) => u.trim().replace(/\/+$/, ''))
+    .filter(Boolean)
+}
+
 export function allowedOrigins(webUrl: string | undefined): string[] {
-  const list = [DEV_ORIGIN]
-  if (webUrl) list.push(webUrl.replace(/\/$/, ''))
-  return list
+  return [DEV_ORIGIN, ...webOrigins(webUrl)]
 }
 
 export const app = new Hono<AppEnv>()

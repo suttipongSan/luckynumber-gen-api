@@ -41,7 +41,9 @@ export function toMember(r: MemberRow, rendersToday: number): Member {
 }
 
 export function memberLink(webUrl: string, linkToken: string): string {
-  return `${webUrl.replace(/\/$/, '')}/m/${linkToken}`
+  // WEB_URL can be a comma-separated list; links always use the first (primary) origin.
+  const primary = (webUrl.split(',')[0] ?? '').trim().replace(/\/+$/, '')
+  return `${primary}/m/${linkToken}`
 }
 
 export function toAdminMember(r: MemberRow, rendersToday: number, webUrl: string): AdminMember {

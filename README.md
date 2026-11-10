@@ -76,10 +76,10 @@ Live on the operator's Cloudflare account (all free plan):
 
 | Piece | Resource |
 |---|---|
-| Worker | `numbergen-api` → https://numbergen-api.luckynumber-01-fpn.workers.dev |
+| Worker | `numbergen-api` → https://api.pnphoto.co (also https://numbergen-api.luckynumbertech.workers.dev) |
 | Database | D1 `numbergen` (binding `DB`, APAC) |
 | Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private) |
-| Web origin | `WEB_URL` in wrangler.toml → https://numbergen-web.luckynumber-01-fpn.workers.dev |
+| Web origin | `WEB_URL` in wrangler.toml → https://pnphoto.co (comma-separated list; first one is used in member links) |
 
 Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`
 (`npx wrangler secret put <NAME>`). Full step-by-step guide: `../numbergen/DEPLOY.md`.

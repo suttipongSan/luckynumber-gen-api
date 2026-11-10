@@ -1,9 +1,11 @@
 // Hono app tests through app.request() with a real libSQL file DB (test.db) and a fake R2 bucket.
+import { STARTER_SETS } from '../src/db/starterSets'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync, rmSync } from 'node:fs'
 import { and, eq } from 'drizzle-orm'
 import app from '../src/index'
 import type { AdminMember, AssetBucket, Bindings, LotterySet, Member } from '../src/types'
+import { MAX_SETS } from '../src/types'
 import { hashPassword, signAsset } from '../src/lib/crypto'
 import { resetLimiter } from '../src/lib/loginLimiter'
 import { getDb } from '../src/db/client'
@@ -215,13 +217,20 @@ describe('member link flow', () => {
     expect(res.status).toBe(401)
   })
 
-  it('GET /sets creates the Default set', async () => {
+  it('GET /sets creates the starter sets, Default first', async () => {
     const res = await req('/sets', { cookie })
     expect(res.status).toBe(200)
     const sets = (await res.json()) as LotterySet[]
-    expect(sets).toHaveLength(1)
+    expect(sets).toHaveLength(STARTER_SETS.length)
     expect(sets[0]).toMatchObject({ name: 'Default', isDefault: true })
-    expect(sets[0].lotteryIds).toContain('hanoi-regular')
+    // same names and order as the starter list; lotteries that exist in the catalog are linked
+    expect(sets.map((s) => s.name)).toEqual(STARTER_SETS.map((s) => s.name))
+    expect(sets.filter((s) => s.isDefault)).toHaveLength(1)
+    const r10 = sets.find((s) => s.name === 'หวยจันทร์-ศุกร์ รอบ 10')!
+    expect(r10.lotteryIds).toEqual(['hanoi-special', 'hanoi-regular', 'hanoi-vip'])
+    expect(r10.rounds).toEqual([1, 1, 1])
+    // a second GET creates nothing new
+    expect(((await (await req('/sets', { cookie })).json()) as LotterySet[]).length).toBe(STARTER_SETS.length)
     const rename = await req(`/sets/${sets[0].id}`, {
       method: 'PATCH',
       cookie,
@@ -710,6 +719,45 @@ describe('review: CORS', () => {
     expect(get.headers.get('access-control-allow-origin')).toBeNull()
   })
 
+  it('WEB_URL can list several origins; member links use the first one', async () => {
+    const multi = { ...env, WEB_URL: 'https://pnphoto.co, https://numbergen-web.example.workers.dev/' }
+    const pre = (origin: string) =>
+      app.request(
+        '/sets',
+        { method: 'OPTIONS', headers: { Origin: origin, 'Access-Control-Request-Method': 'POST' } },
+        multi,
+      )
+    for (const origin of ['https://pnphoto.co', 'https://numbergen-web.example.workers.dev', 'http://localhost:5173']) {
+      expect((await pre(origin)).headers.get('access-control-allow-origin'), origin).toBe(origin)
+    }
+    for (const origin of ['https://evil.example', 'https://pnphoto.co.evil.example', 'https://www.pnphoto.co']) {
+      expect((await pre(origin)).headers.get('access-control-allow-origin'), origin).toBeNull()
+    }
+    const login = await app.request(
+      '/admin/login',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'admin', password: 'admin1234' }),
+      },
+      multi,
+    )
+    expect(login.status).toBe(204)
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0]
+    const created = await app.request(
+      '/admin/members',
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie, Origin: 'https://numbergen-web.example.workers.dev' },
+        body: JSON.stringify({ displayName: 'multi-origin', expiresAt: new Date(Date.now() + 86400000).toISOString() }),
+      },
+      multi,
+    )
+    expect(created.status).toBe(200)
+    const m = (await created.json()) as { link: string; linkToken: string }
+    expect(m.link).toBe(`https://pnphoto.co/m/${m.linkToken}`)
+  })
+
   it('a cross-site multipart upload (no preflight) is refused by the Origin guard', async () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'csrf')
@@ -895,7 +943,7 @@ describe('review: signed asset URLs', () => {
 })
 
 describe('review: sets', () => {
-  it('Default cannot be renamed or deleted; other sets can; max 30 sets', async () => {
+  it('Default cannot be renamed or deleted; other sets can; max 40 sets', async () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'sets')
     const [def] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
@@ -920,7 +968,7 @@ describe('review: sets', () => {
     expect((await call('POST', '/sets', m.cookie, { name: '   ' })).status).toBe(400)
     expect((await call('DELETE', `/sets/${created.id}`, m.cookie)).status).toBe(204)
 
-    for (let i = 0; i < 29; i++) expect((await call('POST', '/sets', m.cookie, { name: `s${i}` })).status).toBe(200)
+    for (let i = 0; i < MAX_SETS - STARTER_SETS.length; i++) expect((await call('POST', '/sets', m.cookie, { name: `s${i}` })).status).toBe(200)
     expect((await call('POST', '/sets', m.cookie, { name: 'one too many' })).status).toBe(409)
   })
 

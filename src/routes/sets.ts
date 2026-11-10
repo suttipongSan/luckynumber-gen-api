@@ -1,5 +1,5 @@
-// Lottery sets ("ชุดรายการ"). The Default set is created on the first GET /sets and can be
-// neither renamed nor deleted.
+// Lottery sets ("ชุดรายการ"). A new member's starter sets (see db/starterSets.ts) are created
+// on the first GET /sets. The Default set can be neither renamed nor deleted.
 import { Hono } from 'hono'
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import type { AppEnv, LotterySet } from '../types'
@@ -7,6 +7,7 @@ import { MAX_SETS } from '../types'
 import { getDb, type DB } from '../db/client'
 import { chunk } from '../lib/chunk'
 import { setLotteries, sets } from '../db/schema'
+import { STARTER_SETS } from '../db/starterSets'
 import { requireMember } from '../middleware/memberAuth'
 import { errors, parseJson } from '../lib/http'
 import { newId } from '../lib/ids'
@@ -14,16 +15,8 @@ import { nowIso } from '../lib/time'
 import { memberLotteryIds } from '../lib/views'
 import { patchSetSchema, setNameSchema } from '../validation'
 
-export const DEFAULT_SET_NAME = 'Default'
-/** Same starter list as the mockup's Default set. */
-export const DEFAULT_SET_LOTTERIES = [
-  'hanoi-regular',
-  'hanoi-vip',
-  'lao-pattana',
-  'lao-samakki',
-  'dow-jones',
-  'thai-gov',
-]
+const starterId = (entry: string | [string, number]): string =>
+  typeof entry === 'string' ? entry : entry[0]
 
 export const setRoutes = new Hono<AppEnv>()
 setRoutes.use('/sets', requireMember())
@@ -92,26 +85,46 @@ function linkInserts(
   return chunk(values, LINK_ROWS_PER_INSERT).map((part) => db.insert(setLotteries).values(part))
 }
 
+// sets has 5 columns; 20 rows × 5 params = 100 bound parameters, D1's per-statement cap.
+const SET_ROWS_PER_INSERT = 20
+
+/**
+ * First visit: creates the member's starter sets (STARTER_SETS, the Default set among them) in
+ * one batch. Members who already have a Default set are left exactly as they are.
+ */
 async function ensureDefault(db: DB, memberId: string): Promise<void> {
   const existing = await db.query.sets.findFirst({
     where: and(eq(sets.memberId, memberId), eq(sets.isDefault, true)),
   })
   if (existing) return
-  const id = newId()
-  const valid = await memberLotteryIds(db, memberId, DEFAULT_SET_LOTTERIES)
-  const ids = DEFAULT_SET_LOTTERIES.filter((l) => valid.has(l))
-  const rounds = ids.map(() => 1)
+  const wanted = [...new Set(STARTER_SETS.flatMap((s) => s.lotteries.map(starterId)))]
+  const valid = await memberLotteryIds(db, memberId, wanted)
+  // createdAt steps by 1 ms so the list keeps this order (it sorts by createdAt, then id).
+  const base = Date.now()
+  const setRows: SetRow[] = []
+  const linkRows: (typeof setLotteries.$inferInsert)[] = []
+  STARTER_SETS.forEach((s, i) => {
+    const id = newId()
+    setRows.push({ id, memberId, name: s.name, isDefault: s.isDefault, createdAt: nowIso(base + i) })
+    const seen = new Set<string>()
+    for (const entry of s.lotteries) {
+      const lotteryId = starterId(entry)
+      if (!valid.has(lotteryId) || seen.has(lotteryId)) continue
+      linkRows.push({
+        setId: id,
+        lotteryId,
+        sortOrder: seen.size,
+        round: typeof entry === 'string' ? 1 : entry[1],
+      })
+      seen.add(lotteryId)
+    }
+  })
+  const ops = [
+    ...chunk(setRows, SET_ROWS_PER_INSERT).map((part) => db.insert(sets).values(part)),
+    ...chunk(linkRows, LINK_ROWS_PER_INSERT).map((part) => db.insert(setLotteries).values(part)),
+  ]
   try {
-    await db.batch([
-      db.insert(sets).values({
-        id,
-        memberId,
-        name: DEFAULT_SET_NAME,
-        isDefault: true,
-        createdAt: nowIso(),
-      }),
-      ...linkInserts(db, id, ids, rounds),
-    ])
+    await db.batch(ops as [(typeof ops)[number], ...(typeof ops)[number][]])
   } catch (e) {
     // A concurrent first GET /sets won the race (unique index sets_one_default_idx); the batch
     // was rolled back as a whole. Anything else is a real error.
