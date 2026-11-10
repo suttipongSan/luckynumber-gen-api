@@ -844,7 +844,7 @@ describe('review: signed asset URLs', () => {
     expect((await get(`/assets/${a}?exp=${far.exp}&sig=${far.sig}`)).status).toBe(403)
   })
 
-  it('upload refuses non-images, SVG, empty, oversize and bad kind; enforces the 20-file quota', async () => {
+  it('upload refuses non-images, SVG, empty, oversize and bad kind; enforces the 2-files-per-kind quota', async () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'quota')
     const up = (file: File, kind = 'logo') => uploadFile(m.cookie, file, kind)
@@ -854,12 +854,24 @@ describe('review: signed asset URLs', () => {
     const big = new File([new Uint8Array(5 * 1024 * 1024 + 1)], 'big.png', { type: 'image/png' })
     expect((await up(big)).status).toBe(400)
     expect((await up(new File([new Uint8Array([1])], 'x.png', { type: 'image/png' }), 'icon')).status).toBe(400)
-    for (let i = 0; i < 20; i++) {
+    // 2 files per kind: a third logo is refused, but other kinds still have room
+    for (let i = 0; i < 2; i++) {
       expect((await up(new File([new Uint8Array([i])], `${i}.png`, { type: 'image/png' }))).status).toBe(200)
     }
     const over = await up(new File([new Uint8Array([1])], 'x.png', { type: 'image/png' }))
     expect(over.status).toBe(409)
     expect(await over.json()).toMatchObject({ error: { code: 'QUOTA' } })
+    for (const kind of ['background', 'qr']) {
+      for (let i = 0; i < 2; i++) {
+        expect((await up(new File([new Uint8Array([i])], `${kind}${i}.png`, { type: 'image/png' }), kind)).status).toBe(200)
+      }
+      expect((await up(new File([new Uint8Array([9])], `${kind}-x.png`, { type: 'image/png' }), kind)).status).toBe(409)
+    }
+    // deleting one frees a slot in that kind
+    const list = (await (await app.request('/assets', { headers: { cookie: m.cookie } }, env)).json()) as { id: string; kind: string }[]
+    const logo = list.find((a) => a.kind === 'logo')!
+    expect((await app.request(`/assets/${logo.id}`, { method: 'DELETE', headers: { cookie: m.cookie } }, env)).status).toBe(204)
+    expect((await up(new File([new Uint8Array([7])], 'again.png', { type: 'image/png' }))).status).toBe(200)
   })
 
   it('deleting an asset removes it from R2 and clears card_settings references', async () => {

@@ -109,7 +109,7 @@ multi-row inserts.
   day (`render_counters`). The counter is incremented atomically first and rolled back when it goes over the limit.
 - **CSRF**: on top of CORS, any non-GET request that carries an `Origin` header outside the allow-list is
   rejected with 403. Multipart uploads are "simple" requests and skip the CORS preflight, which is why this check exists.
-- **Assets**: png, jpg, webp, gif and avif up to 5 MB, 20 per member. SVG is refused. Kinds are
+- **Assets**: png, jpg, webp, gif and avif up to 5 MB, 2 per kind per member. SVG is refused. Kinds are
   `background`, `logo` and `qr` (v2); deleting an asset clears `backgroundAssetId`, `logo.assetId`
   and `qr.assetId` in that member's saved settings.
 - **Member delete** removes the member's sets, settings, assets (DB rows and R2 objects), news reads,
@@ -119,7 +119,7 @@ multi-row inserts.
 
 Five member-review requests (see `../numbergen/API.md` "v2 additions" for the contract).
 
-- **F2 QR code image**: `POST /assets` accepts `kind=qr` (shares the 20-file quota); `CardSettings.qr`
+- **F2 QR code image**: `POST /assets` accepts `kind=qr` (2 per kind, like the other kinds); `CardSettings.qr`
   is validated the same way as `logo`; `POST /render/numbers` signs `qr.assetId`; `DELETE /assets/:id`
   clears it.
 - **F4 rounds**: `set_lotteries.round INTEGER NOT NULL DEFAULT 1` (1..20); `LotterySet.rounds`

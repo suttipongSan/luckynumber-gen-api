@@ -2,13 +2,15 @@
 import { Hono } from 'hono'
 import { and, asc, eq } from 'drizzle-orm'
 import type { AppEnv, Asset, AssetKind, CardSettings } from '../types'
-import { ASSET_URL_TTL_SECONDS, MAX_ASSETS, MAX_ASSET_BYTES } from '../types'
+import { ASSET_URL_TTL_SECONDS, MAX_ASSETS_PER_KIND, MAX_ASSET_BYTES } from '../types'
 import { getDb, type DB } from '../db/client'
 import { assets, cardSettings } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
 import { errors } from '../lib/http'
 import { newId } from '../lib/ids'
 import { nowIso } from '../lib/time'
+
+const KIND_LABEL_TH: Record<AssetKind, string> = { background: 'พื้นหลัง', logo: 'โลโก้', qr: 'QR code' }
 import { signedAssetUrl, verifyAssetSignature } from '../lib/crypto'
 import { apiOrigin } from './render'
 
@@ -148,9 +150,15 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
   if (file.size === 0) throw errors.validation('ไฟล์ว่างเปล่า')
   if (file.size > MAX_ASSET_BYTES) throw errors.validation('ไฟล์ต้องมีขนาดไม่เกิน 5 MB')
 
-  const count = (await db.select({ id: assets.id }).from(assets).where(eq(assets.memberId, memberId)))
-    .length
-  if (count >= MAX_ASSETS) throw errors.conflict('QUOTA', `เก็บไฟล์ได้สูงสุด ${MAX_ASSETS} ไฟล์`)
+  const count = (
+    await db
+      .select({ id: assets.id })
+      .from(assets)
+      .where(and(eq(assets.memberId, memberId), eq(assets.kind, kind)))
+  ).length
+  if (count >= MAX_ASSETS_PER_KIND) {
+    throw errors.conflict('QUOTA', `${KIND_LABEL_TH[kind]} เก็บได้สูงสุด ${MAX_ASSETS_PER_KIND} ไฟล์ ลบไฟล์เดิมก่อนอัปโหลดใหม่`)
+  }
 
   const id = newId()
   const r2Key = r2KeyFor(memberId, id, ext)

@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 # Non-secret configuration. For local dev, .dev.vars overrides these values.
 # Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
 [vars]
-WEB_URL = "https://numbergen-web.luckynumber-01-fpn.workers.dev"
+WEB_URL = "https://numbergen-web.luckynumbertech.workers.dev"
 COOKIE_SECURE = "true"
 
 # Cloudflare D1 (SQLite). Migrations are the drizzle-kit SQL files in drizzle/:
@@ -14,7 +14,7 @@ COOKIE_SECURE = "true"
 [[d1_databases]]
 binding = "DB"
 database_name = "numbergen"
-database_id = "154fbbeb-f402-4dae-aa63-86f0ecc9c773"
+database_id = "7bbe7862-5da9-414d-89bb-ef8aba43721a"
 migrations_dir = "drizzle"
 
 [[r2_buckets]]

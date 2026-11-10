@@ -185,7 +185,8 @@ export interface AppEnv {
 export const RENDERS_PER_DAY = 600
 export const MAX_ITEMS_PER_RENDER = 80
 export const MAX_SETS = 30
-export const MAX_ASSETS = 20
+/** Max files per asset kind (background / logo / qr) per member. */
+export const MAX_ASSETS_PER_KIND = 2
 export const MAX_CUSTOM_LOTTERIES = 30
 export const MIN_ROUND = 1
 export const MAX_ROUND = 20
