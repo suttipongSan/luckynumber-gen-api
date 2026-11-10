@@ -1,6 +1,8 @@
 // Starter sets every new member begins with. Copied from member "PN" on the live site
 // (2026-11-10). Created together on the member's first GET /sets; existing members are not
 // touched. A lottery id that does not exist (or is another member's custom one) is skipped.
+// Exactly one entry has isDefault: true; that set is locked (cannot be renamed or deleted) and
+// marks that the starter sets were created. PN's empty "Default" and "จบ" sets were left out.
 // An entry is a lottery id (round 1) or [id, round].
 export interface StarterSet {
   name: string;
@@ -9,10 +11,9 @@ export interface StarterSet {
 }
 
 export const STARTER_SETS: StarterSet[] = [
-  { name: "Default", isDefault: true, lotteries: [] },
   {
     name: "หวยจันทร์-ศุกร์ รอบ 1",
-    isDefault: false,
+    isDefault: true,
     lotteries: ["hanoi-extra"],
   },
   {
@@ -155,5 +156,4 @@ export const STARTER_SETS: StarterSet[] = [
     isDefault: false,
     lotteries: ["lao-kachad", "dow-jones-vip", "dow-jones-star"],
   },
-  { name: "จบ", isDefault: false, lotteries: [] },
 ];

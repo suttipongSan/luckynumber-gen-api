@@ -217,12 +217,14 @@ describe('member link flow', () => {
     expect(res.status).toBe(401)
   })
 
-  it('GET /sets creates the starter sets, Default first', async () => {
+  it('GET /sets creates the starter sets, the locked one first', async () => {
     const res = await req('/sets', { cookie })
     expect(res.status).toBe(200)
     const sets = (await res.json()) as LotterySet[]
     expect(sets).toHaveLength(STARTER_SETS.length)
-    expect(sets[0]).toMatchObject({ name: 'Default', isDefault: true })
+    expect(sets[0]).toMatchObject({ name: 'หวยจันทร์-ศุกร์ รอบ 1', isDefault: true })
+    expect(sets.map((s) => s.name)).not.toContain('Default')
+    expect(sets.map((s) => s.name)).not.toContain('จบ')
     // same names and order as the starter list; lotteries that exist in the catalog are linked
     expect(sets.map((s) => s.name)).toEqual(STARTER_SETS.map((s) => s.name))
     expect(sets.filter((s) => s.isDefault)).toHaveLength(1)
@@ -954,11 +956,11 @@ describe('review: sets', () => {
     expect(ren.status).toBe(409)
     // the rejected PATCH changed nothing
     const [still] = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
-    expect(still.name).toBe('Default')
+    expect(still.name).toBe(def.name)
     expect(still.lotteryIds).toEqual(def.lotteryIds)
     // its lottery list may still be edited
     const edit = await call('PATCH', `/sets/${def.id}`, m.cookie, { lotteryIds: ['dow-jones'] })
-    expect(await edit.json()).toMatchObject({ name: 'Default', lotteryIds: ['dow-jones'] })
+    expect(await edit.json()).toMatchObject({ name: def.name, lotteryIds: ['dow-jones'] })
 
     const created = (await (await call('POST', '/sets', m.cookie, { name: 'ชุดของฉัน' })).json()) as LotterySet
     const renamed = await call('PATCH', `/sets/${created.id}`, m.cookie, { name: 'ชุดใหม่' })

@@ -1,5 +1,5 @@
 // Lottery sets ("ชุดรายการ"). A new member's starter sets (see db/starterSets.ts) are created
-// on the first GET /sets. The Default set can be neither renamed nor deleted.
+// on the first GET /sets. The default set (isDefault) can be neither renamed nor deleted.
 import { Hono } from 'hono'
 import { and, asc, eq, inArray } from 'drizzle-orm'
 import type { AppEnv, LotterySet } from '../types'
@@ -89,8 +89,8 @@ function linkInserts(
 const SET_ROWS_PER_INSERT = 20
 
 /**
- * First visit: creates the member's starter sets (STARTER_SETS, the Default set among them) in
- * one batch. Members who already have a Default set are left exactly as they are.
+ * First visit: creates the member's starter sets (STARTER_SETS, the locked default set among them) in
+ * one batch. Members who already have a default set are left exactly as they are.
  */
 async function ensureDefault(db: DB, memberId: string): Promise<void> {
   const existing = await db.query.sets.findFirst({
@@ -170,7 +170,7 @@ setRoutes.patch('/sets/:id', async (c) => {
   const body = await parseJson(c, patchSetSchema)
   const row = await ownedSet(db, memberId, c.req.param('id'))
   if (body.name !== undefined && row.isDefault && body.name !== row.name) {
-    throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถเปลี่ยนชื่อชุด Default ได้')
+    throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถเปลี่ยนชื่อชุดหลักได้')
   }
   const ops = []
   if (body.name !== undefined && !row.isDefault) {
@@ -212,7 +212,7 @@ setRoutes.patch('/sets/:id', async (c) => {
 setRoutes.delete('/sets/:id', async (c) => {
   const db = getDb(c.env)
   const row = await ownedSet(db, c.get('member').id, c.req.param('id'))
-  if (row.isDefault) throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถลบชุด Default ได้')
+  if (row.isDefault) throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถลบชุดหลักได้')
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.setId, row.id)),
     db.delete(sets).where(eq(sets.id, row.id)),
