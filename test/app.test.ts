@@ -32,7 +32,7 @@ import {
   members,
   siteSettings,
 } from '../src/db/schema'
-import { utcDay } from '../src/lib/time'
+import { bangkokDay } from '../src/lib/time'
 import { LOTTERY_CATALOG } from '../src/db/catalog'
 
 const DB_FILE = 'test.db'
@@ -884,9 +884,9 @@ describe('review: render limit', () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'limit')
     const db = getDb(env)
-    const today = utcDay()
+    const today = bangkokDay()
     // yesterday was fully used: must not count today
-    await db.insert(renderCounters).values({ memberId: m.id, day: utcDay(Date.now() - 86400_000), count: 600 })
+    await db.insert(renderCounters).values({ memberId: m.id, day: bangkokDay(Date.now() - 86400_000), count: 600 })
 
     const first = await render(m.cookie, 80)
     expect(first.status).toBe(200)
@@ -961,7 +961,7 @@ describe('review: render limit', () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'rt-guard')
     const db = getDb(env)
-    const today = utcDay()
+    const today = bangkokDay()
     const todayRow = and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, today))
     // Seed: 599 renders used today + a non-zero rendersTotal so we can detect any stray increment.
     await db.insert(renderCounters).values({ memberId: m.id, day: today, count: 599 })
@@ -992,7 +992,7 @@ describe('review: render limit', () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'rt-first')
     const db = getDb(env)
-    const today = utcDay()
+    const today = bangkokDay()
     // No render_counters row for today yet — this is the insert branch.
     expect(
       await db.query.renderCounters.findFirst({
@@ -2472,7 +2472,7 @@ describe('v2: F5 member-created lotteries', () => {
     expect(res.status).toBe(404)
     // Counter stayed at 0; the valid half of the request must not consume renders.
     const row = await db.query.renderCounters.findFirst({
-      where: and(eq(renderCounters.memberId, attacker.id), eq(renderCounters.day, utcDay())),
+      where: and(eq(renderCounters.memberId, attacker.id), eq(renderCounters.day, bangkokDay())),
     })
     expect(row?.count ?? 0).toBe(0)
   })
@@ -3066,7 +3066,7 @@ describe('render limit uses the effective limit', () => {
     // Counter untouched.
     const db = getDb(env)
     const row = await db.query.renderCounters.findFirst({
-      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, bangkokDay())),
     })
     expect(row?.count).toBe(5)
   })
@@ -3088,7 +3088,7 @@ describe('render limit uses the effective limit', () => {
     expect((await render(m.cookie, 1)).status).toBe(429)
     const db = getDb(env)
     const row = await db.query.renderCounters.findFirst({
-      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, bangkokDay())),
     })
     expect(row?.count).toBe(3)
   })
@@ -3102,7 +3102,7 @@ describe('render limit uses the effective limit', () => {
     // No counter inserted.
     const db = getDb(env)
     const row = await db.query.renderCounters.findFirst({
-      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())),
+      where: and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, bangkokDay())),
     })
     expect(row).toBeUndefined()
   })
@@ -3119,7 +3119,7 @@ describe('render limit uses the effective limit', () => {
     const db = getDb(env)
     await db.insert(renderCounters).values({
       memberId: m.id,
-      day: utcDay(Date.now() - 86400_000),
+      day: bangkokDay(Date.now() - 86400_000),
       count: 999,
     })
 
@@ -3132,7 +3132,7 @@ describe('render limit uses the effective limit', () => {
     const yesterday = await db.query.renderCounters.findFirst({
       where: and(
         eq(renderCounters.memberId, m.id),
-        eq(renderCounters.day, utcDay(Date.now() - 86400_000)),
+        eq(renderCounters.day, bangkokDay(Date.now() - 86400_000)),
       ),
     })
     expect(yesterday?.count).toBe(999)
@@ -3156,7 +3156,7 @@ describe('render limit uses the effective limit', () => {
     const a = await newMember(admin, 'iso-a')
     const b = await newMember(admin, 'iso-b')
     const db = getDb(env)
-    const day = utcDay()
+    const day = bangkokDay()
     await db.insert(renderCounters).values([
       { memberId: a.id, day, count: 42 },
       { memberId: b.id, day, count: 77 },
@@ -3260,5 +3260,235 @@ describe('review: PATCH /sets concurrent writes', () => {
     const sets = (await (await call('GET', '/sets', m.cookie)).json()) as LotterySet[]
     const same = sets.find((s) => s.id === created.id)!
     expect(same.lotteryIds).toEqual(finalIds)
+  })
+})
+
+describe('review: quotas hold under concurrent creates', () => {
+  // Each POST runs its cheap count pre-check before its own insert, so firing them together
+  // lets every request pass the pre-check; only the conditional INSERT keeps the quota.
+  it('POST /assets: concurrent uploads never exceed the per-kind quota and leave no orphan R2 objects', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'race-assets')
+    const res = await Promise.all(
+      Array.from({ length: 5 }, (_, i) =>
+        uploadFile(m.cookie, new File([new Uint8Array([i + 1])], `r${i}.png`, { type: 'image/png' }), 'qr'),
+      ),
+    )
+    const statuses = res.map((r) => r.status)
+    expect(statuses.filter((s) => s === 200)).toHaveLength(2)
+    expect(statuses.filter((s) => s === 409)).toHaveLength(3)
+    for (const r of res) if (r.status === 409) expect(await r.json()).toMatchObject({ error: { code: 'QUOTA' } })
+    const rows = await getDb(env).select().from(assetsTable).where(eq(assetsTable.memberId, m.id))
+    expect(rows).toHaveLength(2)
+    const keys = [...r2.objects.keys()].filter((k) => k.startsWith(`members/${m.id}/`))
+    expect(keys.sort()).toEqual(rows.map((r) => r.r2Key).sort())
+  })
+
+  it('POST /sets: concurrent creates never exceed MAX_SETS', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'race-sets')
+    await call('GET', '/sets', m.cookie) // creates the starter sets
+    for (let i = 0; i < MAX_SETS - STARTER_SETS.length - 2; i++) {
+      expect((await call('POST', '/sets', m.cookie, { name: `s${i}` })).status).toBe(200)
+    }
+    const res = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => call('POST', '/sets', m.cookie, { name: `race${i}` })),
+    )
+    expect(res.filter((r) => r.status === 200)).toHaveLength(2)
+    for (const r of res) if (r.status !== 200) expect(await r.json()).toMatchObject({ error: { code: 'QUOTA' } })
+    const rows = await getDb(env).select().from(setsTable).where(eq(setsTable.memberId, m.id))
+    expect(rows).toHaveLength(MAX_SETS)
+  })
+
+  it('POST /lotteries: concurrent creates never exceed the custom-lottery quota', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'race-lotteries')
+    for (let i = 0; i < 28; i++) {
+      expect((await call('POST', '/lotteries', m.cookie, { name: `l${i}`, group: 'other' })).status).toBe(200)
+    }
+    const res = await Promise.all(
+      Array.from({ length: 5 }, (_, i) => call('POST', '/lotteries', m.cookie, { name: `race${i}`, group: 'other' })),
+    )
+    expect(res.filter((r) => r.status === 200)).toHaveLength(2)
+    for (const r of res) if (r.status !== 200) expect(await r.json()).toMatchObject({ error: { code: 'QUOTA' } })
+    const rows = await getDb(env).select().from(lotteries).where(eq(lotteries.ownerMemberId, m.id))
+    expect(rows).toHaveLength(30)
+  })
+})
+
+describe('review: PATCH /sets racing DELETE /sets', () => {
+  it('PATCH with lotteryIds against a concurrently deleted set is 200 or 404, never 500', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'patch-delete-race')
+    for (let i = 0; i < 5; i++) {
+      const created = (await (await call('POST', '/sets', m.cookie, { name: `pd${i}` })).json()) as LotterySet
+      const [patch, del] = await Promise.all([
+        call('PATCH', `/sets/${created.id}`, m.cookie, { lotteryIds: ['hanoi-regular', 'thai-gov'] }),
+        call('DELETE', `/sets/${created.id}`, m.cookie),
+      ])
+      expect([200, 404]).toContain(patch.status)
+      expect(del.status).toBe(204)
+      const links = await getDb(env).select().from(setLotteries).where(eq(setLotteries.setId, created.id))
+      expect(links).toHaveLength(0)
+    }
+  })
+})
+
+// ---- concurrency + lock hardening (login reservation, admin /64 + global ceiling, CORS dev
+// origin, reset-password race, member delete R2 sweep, Bangkok render day)
+describe('hardening: login limiter, CORS, member delete, render day', () => {
+  it('parallel wrong link logins cannot exceed the 5-try budget', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'par-lock')
+    const login = (password: string) =>
+      req(`/link/${m.token}/login`, { method: 'POST', body: JSON.stringify({ password }) })
+    const res = await Promise.all(Array.from({ length: 15 }, () => login('wrong-guess')))
+    // Only the 5 reserved tries are verified; the 5th answers 429, the rest are refused unverified.
+    expect(res.filter((r) => r.status === 401).length).toBeLessThanOrEqual(4)
+    expect(res.every((r) => r.status === 401 || r.status === 429)).toBe(true)
+    expect((await login('password-123')).status).toBe(429)
+  })
+
+  it('tries during a lock neither restart the count nor extend the lock', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'lock-hold')
+    const login = (password: string) =>
+      req(`/link/${m.token}/login`, { method: 'POST', body: JSON.stringify({ password }) })
+    for (let i = 0; i < 5; i++) await login('wrong-guess')
+    const key = `link:${m.token}`
+    const before = await getDb(env).query.loginAttempts.findFirst({ where: eq(loginAttempts.key, key) })
+    for (let i = 0; i < 3; i++) expect((await login('wrong-guess')).status).toBe(429)
+    const after = await getDb(env).query.loginAttempts.findFirst({ where: eq(loginAttempts.key, key) })
+    expect(after?.lockedUntil).toBe(before?.lockedUntil)
+    expect(after!.failures).toBeGreaterThan(before!.failures)
+    // An elapsed lock starts a fresh budget.
+    await getDb(env)
+      .update(loginAttempts)
+      .set({ lockedUntil: new Date(Date.now() - 1000).toISOString() })
+      .where(eq(loginAttempts.key, key))
+    expect((await login('password-123')).status).toBe(204)
+  })
+
+  it('ipBucket groups IPv6 by /64 and leaves IPv4 alone', async () => {
+    const { ipBucket } = await import('../src/lib/loginLimiter')
+    expect(ipBucket('203.0.113.9')).toBe('203.0.113.9')
+    expect(ipBucket('2001:DB8:0:1::a')).toBe('2001:db8:0:1::/64')
+    expect(ipBucket('2001:db8:0000:0001:ffff:1:2:3')).toBe('2001:db8:0:1::/64')
+    expect(ipBucket('::ffff:198.51.100.7')).toBe('198.51.100.7')
+    expect(ipBucket('::1')).toBe('0:0:0:0::/64')
+    expect(ipBucket('garbage')).toBe('garbage')
+  })
+
+  const adminLogin = (ip: string, password: string) =>
+    req('/admin/login', {
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': ip },
+      body: JSON.stringify({ username: 'admin', password }),
+    })
+
+  it('admin lock covers a whole IPv6 /64', async () => {
+    for (let i = 1; i <= 4; i++) expect((await adminLogin(`2001:db8:0:1::${i}`, 'wrong')).status).toBe(401)
+    expect((await adminLogin('2001:db8:0:1::5', 'wrong')).status).toBe(429)
+    expect((await adminLogin('2001:db8:0:1:aaaa::1', 'admin1234')).status).toBe(429)
+    expect((await adminLogin('2001:db8:0:2::1', 'admin1234')).status).toBe(204)
+  })
+
+  it('global admin ceiling: 20 failures from rotating IPs lock every address', async () => {
+    for (let i = 1; i <= 19; i++) expect((await adminLogin(`192.0.2.${i}`, 'wrong')).status).toBe(401)
+    expect((await adminLogin('192.0.2.20', 'wrong')).status).toBe(429)
+    expect((await adminLogin('192.0.2.99', 'admin1234')).status).toBe(429)
+    await resetLimiter(getDb(env))
+  })
+
+  it('production (COOKIE_SECURE=true) does not trust http://localhost:5173', async () => {
+    const prod = { ...env, WEB_URL: 'https://pnphoto.co', COOKIE_SECURE: 'true' }
+    const pre = (origin: string) =>
+      app.request(
+        '/sets',
+        { method: 'OPTIONS', headers: { Origin: origin, 'Access-Control-Request-Method': 'POST' } },
+        prod,
+      )
+    expect((await pre('https://pnphoto.co')).headers.get('access-control-allow-origin')).toBe('https://pnphoto.co')
+    expect((await pre('http://localhost:5173')).headers.get('access-control-allow-origin')).toBeNull()
+    const post = await app.request(
+      '/logout',
+      { method: 'POST', headers: { Origin: 'http://localhost:5173' } },
+      prod,
+    )
+    expect(post.status).toBe(403)
+    // Local dev (COOKIE_SECURE=false) still allows it.
+    const dev = await app.request(
+      '/sets',
+      { method: 'OPTIONS', headers: { Origin: 'http://localhost:5173', 'Access-Control-Request-Method': 'POST' } },
+      { ...env, WEB_URL: 'https://pnphoto.co' },
+    )
+    expect(dev.headers.get('access-control-allow-origin')).toBe('http://localhost:5173')
+  })
+
+  it('a login verified against the old hash cannot insert a session after reset-password', async () => {
+    const { insertMemberSessionIfHash, newMemberSessionRow } = await import('../src/lib/session')
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'reset-race')
+    const db = getDb(env)
+    const oldHash = (await db.query.members.findFirst({ where: eq(members.id, m.id) }))!.passwordHash!
+    // Same hash still in place → inserted.
+    expect(await insertMemberSessionIfHash(db, newMemberSessionRow(m.id), oldHash)).toHaveLength(1)
+    expect((await call('POST', `/admin/members/${m.id}/reset-password`, admin)).status).toBe(204)
+    // The racing login's insert lands after the reset → nothing inserted, no session survives.
+    expect(await insertMemberSessionIfHash(db, newMemberSessionRow(m.id), oldHash)).toHaveLength(0)
+    expect(await db.query.memberSessions.findMany({ where: eq(memberSessions.memberId, m.id) })).toHaveLength(0)
+  })
+
+  it('member delete sweeps every R2 object under the member prefix (paginated list)', async () => {
+    class ListableR2 extends FakeR2 {
+      async list(opts: { prefix: string; cursor?: string; limit?: number }) {
+        // Page size 2 regardless of limit, to exercise the cursor loop.
+        const keys = [...this.objects.keys()].filter((k) => k.startsWith(opts.prefix)).sort()
+        const start = opts.cursor ? Number(opts.cursor) : 0
+        const page = keys.slice(start, start + 2)
+        const next = start + 2
+        return { objects: page.map((key) => ({ key })), truncated: next < keys.length, cursor: String(next) }
+      }
+    }
+    const bucket = new ListableR2()
+    const env2 = { ...env, ASSETS: bucket }
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'r2-sweep')
+    const form = new FormData()
+    form.append('kind', 'logo')
+    form.append('file', new File([new Uint8Array([1])], 'a.png', { type: 'image/png' }))
+    expect((await app.request('/assets', { method: 'POST', body: form, headers: { Cookie: m.cookie } }, env2)).status).toBe(200)
+    // Objects with no assets row (an upload that raced the delete) and someone else's object.
+    for (let i = 0; i < 4; i++) await bucket.put(`members/${m.id}/assets/orphan${i}.png`, 'x')
+    await bucket.put('members/someoneElse00001/assets/keep.png', 'x')
+    const del = await app.request(`/admin/members/${m.id}`, { method: 'DELETE', headers: { Cookie: admin } }, env2)
+    expect(del.status).toBe(204)
+    expect([...bucket.objects.keys()]).toEqual(['members/someoneElse00001/assets/keep.png'])
+  })
+
+  it('render day key is the Bangkok (UTC+7) calendar day', async () => {
+    const { bangkokDay } = await import('../src/lib/time')
+    expect(bangkokDay(Date.parse('2026-11-11T16:59:59Z'))).toBe('2026-11-11')
+    expect(bangkokDay(Date.parse('2026-11-11T17:00:00Z'))).toBe('2026-11-12')
+    expect(bangkokDay()).toBe(bangkokDay())
+  })
+})
+
+describe('review: login limiter rows from the previous limiter', () => {
+  it('a lock written by the old limiter (failures = 0) still refuses every try', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'legacy-lock')
+    const key = `link:${m.token}`
+    // The old recordFailure reset failures to 0 when it set the lock.
+    await getDb(env)
+      .insert(loginAttempts)
+      .values({ key, failures: 0, lockedUntil: new Date(Date.now() + 10 * 60_000).toISOString() })
+    for (let i = 0; i < 6; i++) {
+      const res = await req(`/link/${m.token}/login`, {
+        method: 'POST',
+        body: JSON.stringify({ password: 'password-123' }),
+      })
+      expect(res.status).toBe(429)
+    }
   })
 })

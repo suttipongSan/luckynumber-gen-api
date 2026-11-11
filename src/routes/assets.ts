@@ -9,7 +9,7 @@ import { ASSET_URL_TTL_SECONDS, MAX_ASSETS_PER_KIND, MAX_ASSET_BYTES } from '../
 import { getDb, type DB } from '../db/client'
 import { assets, cardSettings } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
-import { errors } from '../lib/http'
+import { changedRows, errors } from '../lib/http'
 import { newId } from '../lib/ids'
 import { nowIso } from '../lib/time'
 
@@ -179,15 +179,17 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
   if (file.size === 0) throw errors.validation('ไฟล์ว่างเปล่า')
   if (file.size > MAX_ASSET_BYTES) throw errors.validation('ไฟล์ต้องมีขนาดไม่เกิน 5 MB')
 
+  const quotaError = () =>
+    errors.conflict('QUOTA', `${KIND_LABEL_TH[kind]} เก็บได้สูงสุด ${MAX_ASSETS_PER_KIND} ไฟล์ ลบไฟล์เดิมก่อนอัปโหลดใหม่`)
+  // Cheap pre-check so the common over-quota case fails before uploading to R2. It is not
+  // authoritative (concurrent uploads can all pass it); the conditional INSERT below is.
   // count(*) rather than selecting ids: one scalar instead of up to MAX_ASSETS_PER_KIND rows.
   const [countRow] = await db
     .select({ c: sql<number>`count(*)` })
     .from(assets)
     .where(and(eq(assets.memberId, memberId), eq(assets.kind, kind)))
   const count = Number(countRow?.c ?? 0)
-  if (count >= MAX_ASSETS_PER_KIND) {
-    throw errors.conflict('QUOTA', `${KIND_LABEL_TH[kind]} เก็บได้สูงสุด ${MAX_ASSETS_PER_KIND} ไฟล์ ลบไฟล์เดิมก่อนอัปโหลดใหม่`)
-  }
+  if (count >= MAX_ASSETS_PER_KIND) throw quotaError()
 
   const id = newId()
   const r2Key = r2KeyFor(memberId, id, ext)
@@ -203,11 +205,28 @@ assetRoutes.post('/assets', requireMember(), async (c) => {
     r2Key,
     createdAt: nowIso(),
   }
+  // Conditional INSERT: the count and the insert are one statement, so SQLite's single writer
+  // makes it atomic and concurrent uploads cannot push the member past the per-kind quota.
+  let inserted: number
   try {
-    await db.insert(assets).values(row)
+    inserted = changedRows(
+      await db.run(sql`
+        insert into assets (id, member_id, kind, file_name, content_type, size_bytes, r2_key, created_at)
+        select ${row.id}, ${row.memberId}, ${row.kind}, ${row.fileName}, ${row.contentType},
+               ${row.sizeBytes}, ${row.r2Key}, ${row.createdAt}
+        where (select count(*) from assets where member_id = ${memberId} and kind = ${kind})
+              < ${MAX_ASSETS_PER_KIND}
+          and exists (select 1 from members where id = ${memberId})`),
+    )
   } catch (e) {
     await c.env.ASSETS.delete(r2Key)
     throw e
+  }
+  if (inserted === 0) {
+    // Lost the quota race to a concurrent upload, or an admin deleted the member while this
+    // upload ran (their R2 prefix sweep may already be done): drop the object we just stored.
+    await c.env.ASSETS.delete(r2Key)
+    throw quotaError()
   }
   return c.json(toAsset(row))
 })

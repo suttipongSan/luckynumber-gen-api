@@ -4,7 +4,8 @@
 //  - top: row*perRow tokens cycling running[0], running[1]
 //  - two / three: unique numbers that each contain at least one running digit
 //    (doubles only with isDouble, triples only with allowTriple)
-//  - drill: 2-digit numbers sharing one prefix digit (from running1/running2/top/two), unique, ≤ 9
+//  - drill: row*perRow 2-digit numbers sharing one prefix digit (from running1/running2/top/two),
+//    unique, so at most 9 (the prefix followed by each other digit)
 //  - win: rows of `digitCount` distinct digits that must include the running (or top) digits
 // The only shape change: two/three are returned as one inner array per row (API.md CardNumbers).
 import type { CardNumbers, CardSettings, DrillPrefixFrom, WinInclude } from '../types'
@@ -101,18 +102,13 @@ export function genThree(count: number, running: [Digit, Digit], allowTriple = f
   return result
 }
 
-/** Each row: prefix digit followed by a random *other* digit, unique across rows (max 9). */
-export function genDrill(rows: number, prefixDigit: number): string[] {
-  const out: string[] = []
-  const tried = new Set<string>()
-  const shuffled = shuffle(DIGITS.filter((d) => d !== prefixDigit))
-  for (let i = 0; i < rows && out.length < 9; i++) {
-    const key = `${prefixDigit}${shuffled[i % shuffled.length]}`
-    if (tried.has(key)) continue
-    tried.add(key)
-    out.push(key)
-  }
-  return out
+/**
+ * `count` tokens: prefix digit followed by a random *other* digit, all unique. Only 9 such
+ * numbers exist, so the result is capped at 9 (a 6x6 drill block gets 9, not 36).
+ */
+export function genDrill(count: number, prefixDigit: number): string[] {
+  const others = shuffle(DIGITS.filter((d) => d !== prefixDigit))
+  return others.slice(0, Math.max(0, Math.min(count, others.length))).map((d) => `${prefixDigit}${d}`)
 }
 
 /**
@@ -142,7 +138,7 @@ export interface GenerateInput {
   top?: { row: number; perRow: number }
   two?: { row: number; perRow: number; isDouble?: boolean }
   three?: { row: number; perRow: number; allowTriple?: boolean }
-  drill?: { row: number; prefixFrom?: DrillPrefixFrom }
+  drill?: { row: number; perRow?: number; prefixFrom?: DrillPrefixFrom }
   win?: { row: number; digitCount?: number; include?: WinInclude }
   fixed?: [number | undefined, number | undefined]
 }
@@ -174,13 +170,15 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
   const top: string[] = []
   for (let i = 0; i < topCount; i++) top.push(String(running[i % 2]))
 
-  const drillRows = cfg.drill?.row ?? 0
+  // Same shape rule as two/three: row rows of perRow tokens (returned flat; the card chunks
+  // them by perRow). Capped at 9 by genDrill.
+  const drillCount = (cfg.drill?.row ?? 0) * Math.max(1, cfg.drill?.perRow ?? 1)
   const prefixFrom = cfg.drill?.prefixFrom ?? 'running1'
   let prefixDigit: number = running[0]
   if (prefixFrom === 'running2') prefixDigit = running[1]
   if (prefixFrom === 'top' && top.length) prefixDigit = Number(top[0])
   if (prefixFrom === 'two' && twoFlat.length) prefixDigit = Number(twoFlat[0][0])
-  const drill = drillRows > 0 ? genDrill(drillRows, prefixDigit) : []
+  const drill = drillCount > 0 ? genDrill(drillCount, prefixDigit) : []
 
   const winRows = cfg.win?.row ?? 0
   const include = cfg.win?.include ?? 'running'
@@ -235,7 +233,7 @@ export function generateForSettings(
     top: { row: rowOf('top', 1), perRow: perOf('top', 1) },
     two: { row: rowOf('two', 2), perRow: perOf('two', 3), isDouble: s.isDouble === true },
     three: { row: rowOf('three', 2), perRow: perOf('three', 3), allowTriple: s.allowTriple === true },
-    drill: { row: rowOf('drill', 2), prefixFrom: s.drillPrefixFrom },
+    drill: { row: rowOf('drill', 2), perRow: perOf('drill', 3), prefixFrom: s.drillPrefixFrom },
     win: { row: rowOf('win', 1), digitCount: clampInt(s.winDigitCount, 2, 7, 6), include: s.winInclude },
     fixed: [f1 ?? s1, f2 ?? s2],
   })

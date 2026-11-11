@@ -4,7 +4,7 @@ import type { DB } from '../db/client'
 import { lotteries, renderCounters, type members } from '../db/schema'
 import type { AdminMember, Group, Lottery, Member, SessionMember } from '../types'
 import { effectiveRenderLimit } from './siteSettings'
-import { isExpired, utcDay } from './time'
+import { isExpired, bangkokDay } from './time'
 import { chunk, IN_CHUNK } from './chunk'
 
 type MemberRow = typeof members.$inferSelect
@@ -70,7 +70,7 @@ export function toAdminMember(
 
 export async function rendersTodayFor(db: DB, memberId: string): Promise<number> {
   const row = await db.query.renderCounters.findFirst({
-    where: and(eq(renderCounters.memberId, memberId), eq(renderCounters.day, utcDay())),
+    where: and(eq(renderCounters.memberId, memberId), eq(renderCounters.day, bangkokDay())),
   })
   return row?.count ?? 0
 }
@@ -78,7 +78,7 @@ export async function rendersTodayFor(db: DB, memberId: string): Promise<number>
 export async function rendersTodayMap(db: DB, memberIds: string[]): Promise<Map<string, number>> {
   const out = new Map<string, number>()
   if (memberIds.length === 0) return out
-  const day = utcDay()
+  const day = bangkokDay()
   for (const part of chunk(memberIds, IN_CHUNK)) {
     const rows = await db
       .select()

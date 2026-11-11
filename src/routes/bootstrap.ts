@@ -25,7 +25,7 @@ import {
   parseDefaultRenderLimit,
   RENDER_LIMIT_DEFAULT,
 } from '../lib/siteSettings'
-import { isExpired, nowIso, utcDay } from '../lib/time'
+import { isExpired, nowIso, bangkokDay } from '../lib/time'
 import { toMember } from '../lib/views'
 import { parseSettingsJson } from './settings'
 import { sortLotteriesForMember } from './lotteries'
@@ -78,7 +78,7 @@ bootstrapRoutes.get('/bootstrap', requireMember({ allowInactive: true }), async 
       .where(
         and(
           eq(renderCounters.memberId, member.id),
-          eq(renderCounters.day, utcDay()),
+          eq(renderCounters.day, bangkokDay()),
         ),
       )
     const defaultLimitQ = db
@@ -112,7 +112,7 @@ bootstrapRoutes.get('/bootstrap', requireMember({ allowInactive: true }), async 
   const counterQ = db
     .select({ count: renderCounters.count })
     .from(renderCounters)
-    .where(and(eq(renderCounters.memberId, member.id), eq(renderCounters.day, utcDay())))
+    .where(and(eq(renderCounters.memberId, member.id), eq(renderCounters.day, bangkokDay())))
   const lotteriesQ = db
     .select()
     .from(lotteries)

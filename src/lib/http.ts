@@ -24,6 +24,16 @@ export const errors = {
   conflict: (code = 'CONFLICT', m = 'ข้อมูลขัดแย้ง') => new ApiError(409, code, m),
 }
 
+/**
+ * Rows changed by a `db.run(...)` write. The two drivers report it differently (D1:
+ * `meta.changes`, libSQL in tests: `rowsAffected`); routes use it to detect a conditional
+ * INSERT ... SELECT ... WHERE that matched nothing (e.g. a quota lost to a concurrent request).
+ */
+export function changedRows(res: unknown): number {
+  const r = res as { rowsAffected?: number; meta?: { changes?: number } } | null
+  return Number(r?.rowsAffected ?? r?.meta?.changes ?? 0)
+}
+
 export function errorJson(c: Context, err: ApiError) {
   return c.json({ error: { code: err.code, message: err.message } }, err.status)
 }

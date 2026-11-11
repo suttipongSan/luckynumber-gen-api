@@ -2,10 +2,10 @@
 // the session row (with its own 24 h expiry, never refreshed) is the source of truth.
 import type { Context } from 'hono'
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie'
-import { eq } from 'drizzle-orm'
+import { and, eq, sql } from 'drizzle-orm'
 import type { AppEnv, SessionMember } from '../types'
 import { SESSION_TTL_SECONDS } from '../types'
-import { getDb } from '../db/client'
+import { getDb, type DB } from '../db/client'
 import { memberSessions, members, adminSessions } from '../db/schema'
 import { hmacSha256Hex, verifyHmacHex } from './crypto'
 import { newToken } from './ids'
@@ -56,6 +56,34 @@ export function newMemberSessionRow(memberId: string) {
     expiresAt: expiryIso(),
     createdAt: nowIso(),
   }
+}
+
+/**
+ * INSERT … SELECT that creates the session only while the member's password_hash still equals
+ * `verifiedHash` (the hash the caller just checked). A concurrent admin reset-password (hash →
+ * NULL + delete sessions) that lands between the verify and this insert makes it insert nothing,
+ * so no session can survive the reset. An empty RETURNING result means "do not log in".
+ * Field order must match the table (drizzle checks it).
+ */
+export function insertMemberSessionIfHash(
+  db: DB,
+  row: ReturnType<typeof newMemberSessionRow>,
+  verifiedHash: string,
+) {
+  return db
+    .insert(memberSessions)
+    .select(
+      db
+        .select({
+          id: sql<string>`${row.id}`.as('id'),
+          memberId: members.id,
+          expiresAt: sql<string>`${row.expiresAt}`.as('expires_at'),
+          createdAt: sql<string>`${row.createdAt}`.as('created_at'),
+        })
+        .from(members)
+        .where(and(eq(members.id, row.memberId), eq(members.passwordHash, verifiedHash))),
+    )
+    .returning({ id: memberSessions.id })
 }
 
 /** Sets the signed cookie for a newly-inserted member session. */

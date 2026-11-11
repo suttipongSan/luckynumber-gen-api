@@ -173,6 +173,12 @@ export interface AssetBucket {
     httpMetadata?: { contentType?: string }
   } | null>
   delete(keys: string | string[]): Promise<void>
+  /** Optional so the Node tests' fake bucket can omit it; the R2 binding always has it. */
+  list?(opts: { prefix: string; cursor?: string; limit?: number }): Promise<{
+    objects: { key: string }[]
+    truncated: boolean
+    cursor?: string
+  }>
 }
 
 export interface Bindings {

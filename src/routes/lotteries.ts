@@ -1,14 +1,14 @@
 // GET /lotteries — active global catalog + the member's own custom lotteries, sorted by group
 // then sortOrder. POST / PATCH / DELETE operate on the member's own lotteries only.
 import { Hono } from 'hono'
-import { and, eq, isNull, or } from 'drizzle-orm'
+import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import type { AppEnv, Lottery } from '../types'
 import { MAX_CUSTOM_LOTTERIES } from '../types'
 import { getDb } from '../db/client'
 import { cardSettings, lotteries, setLotteries } from '../db/schema'
 import { GROUP_ORDER } from '../db/catalog'
 import { requireMember } from '../middleware/memberAuth'
-import { errors, parseJson } from '../lib/http'
+import { changedRows, errors, parseJson } from '../lib/http'
 import { newId } from '../lib/ids'
 import { toLottery } from '../lib/views'
 import { memberLotterySchema, patchMemberLotterySchema } from '../validation'
@@ -63,14 +63,15 @@ lotteryRoutes.post('/lotteries', async (c) => {
   const memberId = c.get('member').id
   const body = await parseJson(c, memberLotterySchema)
 
-  // Enforce 30-per-member quota.
+  // Enforce 30-per-member quota. This read is the fast path; the conditional INSERT below is
+  // what actually holds the quota when several POSTs race.
+  const quotaError = () =>
+    errors.conflict('QUOTA', `สร้างหวยของตัวเองได้สูงสุด ${MAX_CUSTOM_LOTTERIES} รายการ`)
   const existing = await db
     .select({ id: lotteries.id, sortOrder: lotteries.sortOrder })
     .from(lotteries)
     .where(eq(lotteries.ownerMemberId, memberId))
-  if (existing.length >= MAX_CUSTOM_LOTTERIES) {
-    throw errors.conflict('QUOTA', `สร้างหวยของตัวเองได้สูงสุด ${MAX_CUSTOM_LOTTERIES} รายการ`)
-  }
+  if (existing.length >= MAX_CUSTOM_LOTTERIES) throw quotaError()
 
   const shortName = (body.shortName ?? body.name.replace(/\s+/g, '')).slice(0, 20) || body.name.slice(0, 20)
   const highest = existing.reduce((m, r) => Math.max(m, r.sortOrder), 10_000 - 1)
@@ -87,7 +88,16 @@ lotteryRoutes.post('/lotteries', async (c) => {
     active: true,
     ownerMemberId: memberId,
   }
-  await db.insert(lotteries).values(row)
+  // Count and insert in one statement (atomic under SQLite's single writer).
+  const inserted = changedRows(
+    await db.run(sql`
+      insert into lotteries (id, name, short_name, group_key, accent, sort_order, active, owner_member_id)
+      select ${row.id}, ${row.name}, ${row.shortName}, ${row.groupKey}, ${row.accent},
+             ${row.sortOrder}, 1, ${row.ownerMemberId}
+      where (select count(*) from lotteries where owner_member_id = ${memberId})
+            < ${MAX_CUSTOM_LOTTERIES}`),
+  )
+  if (inserted === 0) throw quotaError()
   return c.json(toLottery(row, memberId))
 })
 

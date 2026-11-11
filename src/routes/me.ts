@@ -11,7 +11,7 @@ import {
   parseDefaultRenderLimit,
   RENDER_LIMIT_DEFAULT,
 } from '../lib/siteSettings'
-import { utcDay } from '../lib/time'
+import { bangkokDay } from '../lib/time'
 import { toMember } from '../lib/views'
 
 type BatchSqlite = BatchItem<'sqlite'>
@@ -25,7 +25,7 @@ meRoutes.get('/me', requireMember({ allowInactive: true }), async (c) => {
   const counterQ = db
     .select({ count: renderCounters.count })
     .from(renderCounters)
-    .where(and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, utcDay())))
+    .where(and(eq(renderCounters.memberId, m.id), eq(renderCounters.day, bangkokDay())))
   const defaultQ = db
     .select({ value: siteSettings.value })
     .from(siteSettings)

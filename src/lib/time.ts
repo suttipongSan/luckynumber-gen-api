@@ -2,9 +2,15 @@ export function nowIso(nowMs = Date.now()): string {
   return new Date(nowMs).toISOString()
 }
 
-/** UTC day key `YYYY-MM-DD` used by render_counters. */
-export function utcDay(nowMs = Date.now()): string {
-  return new Date(nowMs).toISOString().slice(0, 10)
+/** Thailand is UTC+7 all year (no DST). */
+const BANGKOK_OFFSET_MS = 7 * 3600 * 1000
+
+/**
+ * Bangkok (UTC+7) day key `YYYY-MM-DD` used by render_counters, so the daily render limit
+ * resets at local midnight (a UTC key reset at 07:00 Thailand time).
+ */
+export function bangkokDay(nowMs = Date.now()): string {
+  return new Date(nowMs + BANGKOK_OFFSET_MS).toISOString().slice(0, 10)
 }
 
 export function isExpired(expiresAt: string, nowMs = Date.now()): boolean {

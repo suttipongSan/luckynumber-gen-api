@@ -26,14 +26,21 @@ export function webOrigins(webUrl: string | undefined): string[] {
     .filter(Boolean)
 }
 
-export function allowedOrigins(webUrl: string | undefined): string[] {
-  return [DEV_ORIGIN, ...webOrigins(webUrl)]
+/**
+ * Origins trusted by CORS and the CSRF guard. The Vite dev origin is added only outside
+ * production: COOKIE_SECURE is 'true' in wrangler.toml [vars] (production) and 'false' in
+ * .dev.vars (local http), so a page on a visitor's localhost:5173 cannot ride production
+ * cookies. Local dev normally lists the dev origin in WEB_URL anyway.
+ */
+export function allowedOrigins(env: { WEB_URL?: string; COOKIE_SECURE?: string }): string[] {
+  const listed = webOrigins(env.WEB_URL)
+  return env.COOKIE_SECURE === 'true' ? listed : [DEV_ORIGIN, ...listed]
 }
 
 export const app = new Hono<AppEnv>()
 
 app.use('*', async (c, next) => {
-  const allowed = allowedOrigins(c.env.WEB_URL)
+  const allowed = allowedOrigins(c.env)
   return cors({
     origin: (origin) => (allowed.includes(origin) ? origin : null),
     credentials: true,
@@ -50,7 +57,7 @@ app.use('*', async (c, next) => {
   const method = c.req.method
   if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
     const origin = c.req.header('Origin')
-    if (origin && !allowedOrigins(c.env.WEB_URL).includes(origin)) {
+    if (origin && !allowedOrigins(c.env).includes(origin)) {
       throw errors.forbidden('Origin not allowed')
     }
   }

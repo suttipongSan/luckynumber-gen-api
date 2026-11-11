@@ -10,7 +10,7 @@ import { chunk, IN_CHUNK } from '../lib/chunk'
 import { lotteries, setLotteries, sets } from '../db/schema'
 import { STARTER_SETS } from '../db/starterSets'
 import { requireMember } from '../middleware/memberAuth'
-import { errors, parseJson } from '../lib/http'
+import { changedRows, errors, parseJson } from '../lib/http'
 import { newId } from '../lib/ids'
 import { nowIso } from '../lib/time'
 import { memberLotteryIds } from '../lib/views'
@@ -172,9 +172,18 @@ setRoutes.post('/sets', async (c) => {
     await ensureDefault(db, memberId)
     stats = await countAndDefault(db, memberId)
   }
-  if (stats.total >= MAX_SETS) throw errors.conflict('QUOTA', `สร้างชุดได้สูงสุด ${MAX_SETS} ชุด`)
+  const quotaError = () => errors.conflict('QUOTA', `สร้างชุดได้สูงสุด ${MAX_SETS} ชุด`)
+  // The pre-check is the fast path; the conditional INSERT is what actually holds the quota
+  // when several POSTs race (count and insert in one statement = atomic in SQLite).
+  if (stats.total >= MAX_SETS) throw quotaError()
   const row: SetRow = { id: newId(), memberId, name, isDefault: false, createdAt: nowIso() }
-  await db.insert(sets).values(row)
+  const inserted = changedRows(
+    await db.run(sql`
+      insert into sets (id, member_id, name, is_default, created_at)
+      select ${row.id}, ${row.memberId}, ${row.name}, 0, ${row.createdAt}
+      where (select count(*) from sets where member_id = ${memberId}) < ${MAX_SETS}`),
+  )
+  if (inserted === 0) throw quotaError()
   const out: LotterySet = { id: row.id, name: row.name, isDefault: false, lotteryIds: [], rounds: [] }
   return c.json(out)
 })
@@ -301,7 +310,19 @@ setRoutes.patch('/sets/:id', async (c) => {
   }
 
   if (writeOps.length) {
-    await db.batch(writeOps as [BatchSqlite, ...BatchSqlite[]])
+    try {
+      await db.batch(writeOps as [BatchSqlite, ...BatchSqlite[]])
+    } catch (e) {
+      // A concurrent DELETE /sets/:id that commits between our read and this batch makes the
+      // link inserts fail their FOREIGN KEY to sets (the batch rolls back as a whole). Report
+      // that as the set being gone rather than a 500; any other failure is a real error.
+      const still = await db
+        .select({ id: sets.id })
+        .from(sets)
+        .where(and(eq(sets.id, setId), eq(sets.memberId, memberId)))
+      if (still.length === 0) throw errors.notFound('ไม่พบชุดรายการ')
+      throw e
+    }
   }
 
   // Response from in-memory state — no extra reads.

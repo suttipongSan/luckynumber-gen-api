@@ -17,7 +17,7 @@ import {
   parseDefaultRenderLimit,
   RENDER_LIMIT_DEFAULT,
 } from '../lib/siteSettings'
-import { utcDay } from '../lib/time'
+import { bangkokDay } from '../lib/time'
 import { renderSchema } from '../validation'
 import { parseSettingsJson } from './settings'
 
@@ -45,7 +45,8 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   const member = c.get('member')
   const body = await parseJson(c, renderSchema)
   const n = body.items.length
-  const day = utcDay()
+  // Thailand calendar day: the daily limit resets at Bangkok midnight.
+  const day = bangkokDay()
 
   // Lotteries must exist and belong to this member (global catalog OR owned by them).
   // Inactive ones are still allowed so saved sets keep working. ids.length ≤ 80 (zod cap, also
