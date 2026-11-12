@@ -3521,6 +3521,46 @@ describe('review: เลขเด่น (single) and element frames', () => {
     }
   })
 
+  it('settings accept elements.*.frameW / frameH inside the editor range and reject anything else', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'frame-size-zod')
+    const put = (body: unknown) => call('PUT', '/settings/dow-jones', m.cookie, body)
+    // The editor sliders (web cardFrames.ts) allow width 60..1160 and height 20..400.
+    for (const size of [
+      { frameW: 'wide' },
+      { frameW: null },
+      { frameW: true },
+      { frameW: {} },
+      { frameW: 59 },
+      { frameW: 1161 },
+      { frameW: 99999 },
+      { frameW: -5 },
+      { frameH: '40' },
+      { frameH: null },
+      { frameH: [] },
+      { frameH: 19 },
+      { frameH: 401 },
+      { frameH: -1 },
+    ]) {
+      const res = await put({ elements: { running: { frame: true, ...size } } })
+      expect(res.status, JSON.stringify(size)).toBe(400)
+    }
+    for (const size of [{}, { frameW: 60, frameH: 20 }, { frameW: 1160, frameH: 400 }, { frameW: 333.5, frameH: 88 }]) {
+      const res = await put({ elements: { single: { visible: true, x: 1000, y: 430, frame: true, ...size } } })
+      expect(res.status, JSON.stringify(size)).toBeLessThan(300)
+    }
+    // The last accepted body is what is stored, and the rejected ones did not replace it.
+    expect(await (await call('GET', '/settings/dow-jones', m.cookie)).json()).toEqual({
+      elements: { single: { visible: true, x: 1000, y: 430, frame: true, frameW: 333.5, frameH: 88 } },
+    })
+    // The same bounds apply to an override inside /render/numbers.
+    const r = await call('POST', '/render/numbers', m.cookie, {
+      items: [{ lotteryId: 'dow-jones', settings: { elements: { single: { frameW: 5000 } } } }],
+      date: '2026-11-06',
+    })
+    expect(r.status).toBe(400)
+  })
+
   it('POST /render/numbers always returns single, honouring fixedSingle', async () => {
     const admin = await adminCookie()
     const m = await newMember(admin, 'single-render')

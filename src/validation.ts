@@ -24,6 +24,10 @@ export const elementStyleSchema = z.looseObject({
   x: num.optional(),
   y: num.optional(),
   frame: z.boolean().optional(),
+  // Manual size of the drawn frame in viewBox units, same bounds as the editor sliders (web
+  // cardFrames.ts). Unset = the automatic size.
+  frameW: num.min(60).max(1160).optional(),
+  frameH: num.min(20).max(400).optional(),
 })
 
 const rectSchema = z.looseObject({

@@ -80,6 +80,12 @@ export interface ElementStyle {
   y?: number
   /** Whether the element's box/pill outline is drawn (date/running/single). undefined = true. */
   frame?: boolean
+  /**
+   * Manual width / height of that frame (viewBox units; width 60..1160, height 20..400).
+   * undefined = the automatic size.
+   */
+  frameW?: number
+  frameH?: number
   [key: string]: unknown
 }
 
