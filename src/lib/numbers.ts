@@ -7,6 +7,8 @@
 //  - drill: row*perRow 2-digit numbers sharing one prefix digit (from running1/running2/top/two),
 //    unique, so at most 9 (the prefix followed by each other digit)
 //  - win: rows of `digitCount` distinct digits that must include the running (or top) digits
+//  - single (เลขเด่น): one 1/2/3-digit number — a running digit, or one number from the two/three
+//    pool — unless fixedSingle locks it
 // The only shape change: two/three are returned as one inner array per row (API.md CardNumbers).
 import type { CardNumbers, CardSettings, DrillPrefixFrom, WinInclude } from '../types'
 
@@ -141,6 +143,26 @@ export interface GenerateInput {
   drill?: { row: number; perRow?: number; prefixFrom?: DrillPrefixFrom }
   win?: { row: number; digitCount?: number; include?: WinInclude }
   fixed?: [number | undefined, number | undefined]
+  single?: { digits?: number; fixed?: string | null; isDouble?: boolean; allowTriple?: boolean }
+}
+
+/** A fixed เลขเด่น counts only when it is all digits and exactly `digits` long. */
+export function parseFixedSingle(v: unknown, digits: number): string | undefined {
+  return typeof v === 'string' && v.length === digits && /^\d+$/.test(v) ? v : undefined
+}
+
+/**
+ * One เลขเด่น of `digits` (1..3) digits. 1 = one of the running digits; 2/3 = one number from the
+ * same pool as genTwo/genThree (contains a running digit; isDouble/allowTriple respected).
+ */
+export function genSingle(
+  digits: number,
+  running: [Digit, Digit],
+  opts?: { isDouble?: boolean; allowTriple?: boolean },
+): string {
+  if (digits === 1) return String(pick(running))
+  if (digits === 3) return genThree(1, running, opts?.allowTriple)[0]
+  return genTwo(1, running, { isDouble: opts?.isDouble })[0]
 }
 
 function chunk(arr: string[], size: number): string[][] {
@@ -190,6 +212,13 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
         : [running[0], running[1]]
   const win = winRows > 0 ? genWin(winRows, cfg.win?.digitCount ?? 6, mustInclude) : []
 
+  // Drawn last, with its own random calls, so every number above keeps exactly the distribution
+  // it had before เลขเด่น existed.
+  const singleDigits = clampInt(cfg.single?.digits, 1, 3, 2)
+  const single =
+    parseFixedSingle(cfg.single?.fixed, singleDigits) ??
+    genSingle(singleDigits, running, { isDouble: cfg.single?.isDouble, allowTriple: cfg.single?.allowTriple })
+
   return {
     running: [String(running[0]), String(running[1])],
     top,
@@ -197,6 +226,7 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
     three: chunk(threeFlat, threePer),
     drill,
     win,
+    single,
   }
 }
 
@@ -236,5 +266,11 @@ export function generateForSettings(
     drill: { row: rowOf('drill', 2), perRow: perOf('drill', 3), prefixFrom: s.drillPrefixFrom },
     win: { row: rowOf('win', 1), digitCount: clampInt(s.winDigitCount, 2, 7, 6), include: s.winInclude },
     fixed: [f1 ?? s1, f2 ?? s2],
+    single: {
+      digits: s.singleDigits,
+      fixed: s.fixedSingle,
+      isDouble: s.isDouble === true,
+      allowTriple: s.allowTriple === true,
+    },
   })
 }

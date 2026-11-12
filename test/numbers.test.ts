@@ -209,3 +209,62 @@ describe('generateForSettings', () => {
     expect(genDrill(0, 4)).toEqual([])
   })
 })
+
+describe('เลขเด่น (single)', () => {
+  it('defaults to one 2-digit number from the genTwo pool', () => {
+    for (let i = 0; i < RUNS; i++) {
+      const n = generateForSettings(null)
+      expect(n.single).toMatch(/^\d{2}$/)
+      expect(containsRunning(n.single, n.running)).toBe(true)
+      expect(n.single[0]).not.toBe(n.single[1])
+    }
+  })
+  it('singleDigits 1 is one of the running digits', () => {
+    for (let i = 0; i < RUNS; i++) {
+      const n = generateForSettings({ singleDigits: 1 })
+      expect(n.running).toContain(n.single)
+    }
+  })
+  it('singleDigits 3 is from the genThree pool; triples only with allowTriple', () => {
+    for (let i = 0; i < RUNS; i++) {
+      const n = generateForSettings({ singleDigits: 3, fixedRunning1: 1, fixedRunning2: 2 })
+      expect(n.single).toMatch(/^\d{3}$/)
+      expect(containsRunning(n.single, n.running)).toBe(true)
+      expect(['111', '222']).not.toContain(n.single)
+    }
+    const seen = new Set<string>()
+    for (let i = 0; i < 4000; i++) {
+      seen.add(generateForSettings({ singleDigits: 3, allowTriple: true, fixedRunning1: 1, fixedRunning2: 2 }).single)
+    }
+    expect(seen.has('111') || seen.has('222')).toBe(true)
+  })
+  it('isDouble lets the 2-digit single be a double', () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < 2000; i++) {
+      seen.add(generateForSettings({ isDouble: true, fixedRunning1: 1, fixedRunning2: 2 }).single)
+    }
+    expect(seen.has('11') || seen.has('22')).toBe(true)
+  })
+  it('fixedSingle locks it only when it is exactly singleDigits digits', () => {
+    expect(generateForSettings({ fixedSingle: '07' }).single).toBe('07')
+    expect(generateForSettings({ singleDigits: 1, fixedSingle: '5' }).single).toBe('5')
+    expect(generateForSettings({ singleDigits: 3, fixedSingle: '999' }).single).toBe('999')
+    for (let i = 0; i < 50; i++) {
+      // wrong length / not digits → random from the pool
+      const a = generateForSettings({ singleDigits: 3, fixedSingle: '12', fixedRunning1: 4, fixedRunning2: 5 })
+      expect(a.single).toMatch(/^\d{3}$/)
+      expect(containsRunning(a.single, a.running)).toBe(true)
+      const b = generateForSettings({ fixedSingle: '1x', fixedRunning1: 4, fixedRunning2: 5 })
+      expect(containsRunning(b.single, b.running)).toBe(true)
+      const c = generateForSettings({ fixedSingle: null, singleDigits: 1 })
+      expect(c.running).toContain(c.single)
+    }
+  })
+  it('out-of-range singleDigits is clamped (stored JSON is loose)', () => {
+    expect(generateForSettings({ singleDigits: 9 as never }).single).toMatch(/^\d{3}$/)
+    expect(generateForSettings({ singleDigits: 0 as never }).single).toMatch(/^\d$/)
+  })
+  it('generateCardNumbers always returns single', () => {
+    expect(generateCardNumbers({}).single).toMatch(/^\d{2}$/)
+  })
+})

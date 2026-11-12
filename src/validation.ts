@@ -23,6 +23,7 @@ export const elementStyleSchema = z.looseObject({
   strokeWidth: num.min(0).max(100).optional(),
   x: num.optional(),
   y: num.optional(),
+  frame: z.boolean().optional(),
 })
 
 const rectSchema = z.looseObject({
@@ -54,6 +55,10 @@ export const cardSettingsSchema = z
     fixedRunning2: fixedDigit,
     drillPrefixFrom: z.enum(['running1', 'running2', 'top', 'two']).optional(),
     winInclude: z.enum(['running', 'top', 'none']).optional(),
+    singleDigits: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
+    // '' is allowed so a cleared input can be saved as-is; the generator treats any value that
+    // is not exactly singleDigits long as "random".
+    fixedSingle: z.string().regex(/^\d{0,3}$/, 'fixedSingle must be up to 3 digits').nullable().optional(),
     elements: z.record(z.string().max(40), elementStyleSchema).optional(),
     rects: z.array(rectSchema).max(50).optional(),
     texts: z.array(textSchema).max(50).optional(),

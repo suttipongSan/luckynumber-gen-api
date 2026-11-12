@@ -3492,3 +3492,50 @@ describe('review: login limiter rows from the previous limiter', () => {
     }
   })
 })
+
+describe('review: เลขเด่น (single) and element frames', () => {
+  it('settings accept singleDigits / fixedSingle / elements.*.frame and reject bad values', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'single-zod')
+    const put = (body: unknown) => call('PUT', '/settings/dow-jones', m.cookie, body)
+    for (const body of [
+      { singleDigits: 0 },
+      { singleDigits: 4 },
+      { singleDigits: 1.5 },
+      { fixedSingle: '1234' },
+      { fixedSingle: '1a' },
+      { fixedSingle: 12 },
+      { elements: { single: { frame: 'no' } } },
+    ]) {
+      const res = await put(body)
+      expect(res.status, JSON.stringify(body)).toBe(400)
+    }
+    for (const body of [
+      { singleDigits: 3, fixedSingle: '123' },
+      { singleDigits: 1, fixedSingle: null },
+      { fixedSingle: '' },
+      { elements: { single: { visible: true, x: 1010, y: 430, frame: false }, date: { frame: false } } },
+    ]) {
+      const res = await put(body)
+      expect(res.status, JSON.stringify(body)).toBeLessThan(300)
+    }
+  })
+
+  it('POST /render/numbers always returns single, honouring fixedSingle', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'single-render')
+    const res = await call('POST', '/render/numbers', m.cookie, {
+      items: [
+        { lotteryId: 'dow-jones' },
+        { lotteryId: 'dow-jones', settings: { singleDigits: 3, fixedSingle: '789' } },
+        { lotteryId: 'dow-jones', settings: { singleDigits: 1 } },
+      ],
+      date: '2026-11-06',
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as { results: { numbers: { running: [string, string]; single: string } }[] }
+    expect(body.results[0].numbers.single).toMatch(/^\d{2}$/)
+    expect(body.results[1].numbers.single).toBe('789')
+    expect(body.results[2].numbers.running).toContain(body.results[2].numbers.single)
+  })
+})

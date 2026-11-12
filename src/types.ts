@@ -78,6 +78,8 @@ export interface ElementStyle {
   strokeWidth?: number
   x?: number
   y?: number
+  /** Whether the element's box/pill outline is drawn (date/running/single). undefined = true. */
+  frame?: boolean
   [key: string]: unknown
 }
 
@@ -94,6 +96,10 @@ export interface CardSettings {
   drillPrefixFrom?: DrillPrefixFrom
   /** Which digits every win (เลขวิน) row must contain. Default 'running'. */
   winInclude?: WinInclude
+  /** Digit count of the single highlighted number (เลขเด่น). Default 2. */
+  singleDigits?: 1 | 2 | 3
+  /** Locks เลขเด่น when it is exactly `singleDigits` digits; anything else = random. */
+  fixedSingle?: string | null
   elements?: {
     lotteryName?: ElementStyle
     date?: ElementStyle
@@ -103,6 +109,7 @@ export interface CardSettings {
     three?: ElementStyle
     drill?: ElementStyle
     win?: ElementStyle
+    single?: ElementStyle
     [key: string]: ElementStyle | undefined
   }
   backgroundAssetId?: string | null
@@ -120,6 +127,8 @@ export interface CardNumbers {
   three: string[][]
   drill: string[]
   win: string[]
+  /** เลขเด่น: one 1..3 digit number (always present, even when the element is hidden). */
+  single: string
 }
 
 export interface News {
