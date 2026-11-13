@@ -3579,3 +3579,127 @@ describe('review: เลขเด่น (single) and element frames', () => {
     expect(body.results[2].numbers.running).toContain(body.results[2].numbers.single)
   })
 })
+
+describe('review: 2 ตัว / 3 ตัว row rules and runningDouble', () => {
+  const DATE = '2026-11-06'
+  type Numbers = { running: [string, string]; two: string[][]; three: string[][]; single: string }
+  const renderAll = async (cookie: string, items: unknown[]) => {
+    const res = await call('POST', '/render/numbers', cookie, { items, date: DATE })
+    expect(res.status).toBe(200)
+    return ((await res.json()) as { results: { numbers: Numbers }[] }).results.map((r) => r.numbers)
+  }
+
+  it('settings accept runningDouble as a boolean (stored as sent) and reject anything else', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'running-double-zod')
+    const put = (body: unknown) => call('PUT', '/settings/dow-jones', m.cookie, body)
+    for (const body of [
+      { runningDouble: 'yes' },
+      { runningDouble: 'true' },
+      { runningDouble: 1 },
+      { runningDouble: 0 },
+      { runningDouble: null },
+      { runningDouble: {} },
+      { runningDouble: [] },
+    ]) {
+      const res = await put(body)
+      expect(res.status, JSON.stringify(body)).toBe(400)
+      expect(await res.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+    }
+    for (const value of [true, false]) {
+      const res = await put({ runningDouble: value, isDouble: true })
+      expect(res.status).toBe(200)
+      expect(await res.json()).toEqual({ runningDouble: value, isDouble: true })
+      expect(await (await call('GET', '/settings/dow-jones', m.cookie)).json()).toEqual({
+        runningDouble: value,
+        isDouble: true,
+      })
+    }
+    // absent stays absent (default false)
+    expect((await put({ isDouble: false })).status).toBe(200)
+    expect(await (await call('GET', '/settings/dow-jones', m.cookie)).json()).toEqual({ isDouble: false })
+
+    // the bulk endpoint shares the schema
+    const bulk = await call('PUT', '/settings', m.cookie, {
+      items: [{ lotteryId: 'dow-jones', settings: { runningDouble: true } }],
+    })
+    expect(bulk.status).toBe(200)
+    expect(await bulk.json()).toEqual({ settings: { 'dow-jones': { runningDouble: true } } })
+    const badBulk = await call('PUT', '/settings', m.cookie, {
+      items: [{ lotteryId: 'dow-jones', settings: { runningDouble: 'true' } }],
+    })
+    expect(badBulk.status).toBe(400)
+    expect(await (await call('GET', '/settings/dow-jones', m.cookie)).json()).toEqual({ runningDouble: true })
+  })
+
+  it('POST /render/numbers validates the runningDouble override and ignores it when generating', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'running-double-render')
+    const bad = await call('POST', '/render/numbers', m.cookie, {
+      items: [{ lotteryId: 'dow-jones', settings: { runningDouble: 'yes' } }],
+      date: DATE,
+    })
+    expect(bad.status).toBe(400)
+    expect(await bad.json()).toMatchObject({ error: { code: 'VALIDATION' } })
+
+    const fixed = { fixedRunning1: 8, fixedRunning2: 1 }
+    const numbers = await renderAll(m.cookie, [
+      { lotteryId: 'dow-jones', settings: { ...fixed, runningDouble: true } },
+      { lotteryId: 'dow-jones', settings: { ...fixed, runningDouble: false } },
+      { lotteryId: 'dow-jones', settings: fixed },
+    ])
+    for (const n of numbers) {
+      // display only: still the single digits, and every number as if the flag were off
+      expect(n.running).toEqual(['8', '1'])
+      expect(n.single).toBe('81')
+      expect(n.two[0].every((t) => t[0] === '8')).toBe(true)
+      expect(n.two[1].every((t) => t[0] === '1')).toBe(true)
+    }
+
+    // a saved runningDouble is read the same way
+    expect((await call('PUT', '/settings/dow-jones', m.cookie, { ...fixed, runningDouble: true })).status).toBe(200)
+    const [saved] = await renderAll(m.cookie, [{ lotteryId: 'dow-jones' }])
+    expect(saved.running).toEqual(['8', '1'])
+    expect(saved.single).toBe('81')
+  })
+
+  it('POST /render/numbers lays 2 ตัว / 3 ตัว out by the row rules, every row full', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'row-rules-render')
+    const settings = (rows: number, perRow: number) => ({
+      fixedRunning1: 8,
+      fixedRunning2: 1,
+      elements: { two: { row: rows, perRow }, three: { row: rows, perRow } },
+    })
+    const items: unknown[] = []
+    const shapes: [number, number][] = []
+    for (const rows of [1, 2, 3, 4, 6]) {
+      for (const perRow of [1, 3, 6]) {
+        shapes.push([rows, perRow])
+        items.push({ lotteryId: 'dow-jones', settings: settings(rows, perRow) })
+      }
+    }
+    const numbers = await renderAll(m.cookie, items)
+    expect(numbers).toHaveLength(shapes.length)
+    numbers.forEach((n, i) => {
+      const [rows, perRow] = shapes[i]
+      const at = `${rows} x ${perRow}`
+      expect(n.two.map((r) => r.length), at).toEqual(Array(rows).fill(perRow))
+      expect(n.three.map((r) => r.length), at).toEqual(Array(rows).fill(perRow))
+      expect(new Set(n.two.flat()).size, at).toBe(rows * perRow)
+      expect(new Set(n.three.flat()).size, at).toBe(rows * perRow)
+      // isDouble / allowTriple are off in these settings, in every row
+      for (const t of n.two.flat()) expect(t[0], `${at}: ${t}`).not.toBe(t[1])
+      for (const t of n.three.flat()) expect(new Set(t).size, `${at}: ${t}`).toBeGreaterThan(1)
+      if (rows === 1) {
+        for (const t of n.two[0]) expect(['8', '1'], `${at}: ${t}`).toContain(t[0])
+        for (const t of n.three[0]) expect(t.includes('8') || t.includes('1'), `${at}: ${t}`).toBe(true)
+      } else {
+        for (const t of n.two[0]) expect(t[0], `${at}: ${t}`).toBe('8')
+        for (const t of n.two[1]) expect(t[0], `${at}: ${t}`).toBe('1')
+        for (const t of n.three[0]) expect(t, at).toContain('8')
+        for (const t of n.three[1]) expect(t, at).toContain('1')
+      }
+    })
+  })
+})

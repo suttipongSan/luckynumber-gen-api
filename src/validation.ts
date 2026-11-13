@@ -55,6 +55,8 @@ export const cardSettingsSchema = z
     separator: z.string().max(10).optional(),
     isDouble: z.boolean().optional(),
     allowTriple: z.boolean().optional(),
+    // Display only (the card draws each running digit twice); the generator never reads it.
+    runningDouble: z.boolean().optional(),
     winDigitCount: z.number().int().min(2).max(7).optional(),
     fixedRunning1: fixedDigit,
     fixedRunning2: fixedDigit,

@@ -147,6 +147,12 @@ export interface CardSettings {
   singleDigits?: 1 | 2 | 3
   /** Locks เลขเด่น when it is exactly `singleDigits` digits; anything else = random. */
   fixedSingle?: string | null
+  /**
+   * Display only: the card draws each running digit twice ("8 - 1" becomes "88 - 11"). Stored with
+   * the settings; the generator ignores it, so the running digits and every number are unchanged.
+   * Default false / absent.
+   */
+  runningDouble?: boolean
   elements?: {
     lotteryName?: ElementStyle
     date?: ElementStyle
@@ -168,9 +174,9 @@ export interface CardSettings {
 export interface CardNumbers {
   running: [string, string]
   top: string[]
-  /** One inner array per row. */
+  /** One inner array per row, each holding exactly `perRow` numbers (row rules: lib/numbers.ts). */
   two: string[][]
-  /** One inner array per row. */
+  /** One inner array per row, each holding exactly `perRow` numbers (row rules: lib/numbers.ts). */
   three: string[][]
   drill: string[]
   win: string[]

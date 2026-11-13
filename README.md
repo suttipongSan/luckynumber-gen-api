@@ -17,7 +17,7 @@ src/db/client.ts        getDb(env): D1 binding in Workers, libSQL file DB in Nod
 src/lib/chunk.ts        splits IN lists / multi-row inserts under D1's 100-parameter limit
 src/lib/crypto.ts       PBKDF2 passwords, constant-time compare, HMAC, signed asset URLs
 src/lib/session.ts      ng_session / ng_admin cookies (signed id + DB row, 24 h, not refreshed)
-src/lib/numbers.ts      number generation (port of the mockup's lib/numbers.ts)
+src/lib/numbers.ts      number generation: running digits, top, 2 ตัว / 3 ตัว row rules, drill, win, เลขเด่น ("Number generation" below)
 src/lib/ids.ts          16-char base62 ids, 32-char tokens
 src/lib/loginLimiter.ts 5 wrong passwords → 429 for 15 min (login_attempts table)
 src/lib/siteSettings.ts site_settings key whitelist, compiled-in defaults, effective-limit helpers
@@ -136,6 +136,44 @@ multi-row inserts.
   daily render limit. GET/PUT are at `/admin/settings`; public `GET /contacts` exposes just the
   two channel objects (null when the id is empty) with `Cache-Control: public, max-age=60`.
   Every key has a compiled-in default (`src/lib/siteSettings.ts`) so a fresh DB keeps working.
+
+## Number generation (2 ตัว, 3 ตัว, เลขเด่น)
+
+`src/lib/numbers.ts` draws every number of a card for `POST /render/numbers`. The two running digits
+(เลขวิ่ง / รูด) are always distinct; call them r1 and r2 (a digit fixed in the request or in the saved
+`fixedRunning1/2` is used slot by slot, the rest is random). The rules apply to every card; there is no
+per-lottery switch.
+
+| Block | exactly 1 row | 2 or more rows |
+|---|---|---|
+| 2 ตัว (`two`, 2-digit numbers) | every number starts with r1 or r2 | row 1 starts with r1, row 2 starts with r2, rows 3 and beyond are any 2-digit number (00-99) |
+| 3 ตัว (`three`, 3-digit numbers) | every number contains r1 or r2 (any position) | row 1 contains r1, row 2 contains r2 (any position), rows 3 and beyond are any 3-digit number (000-999) |
+
+With r1 = 8, r2 = 1, three rows of three, 2 ตัว could be `82 85 80 / 14 17 18 / 87 29 60`.
+
+- `isDouble` off keeps 00, 11 .. 99 out of every 2 ตัว row and `allowTriple` off keeps 000, 111 .. 999 out of
+  every 3 ตัว row, the random rows included.
+- No number appears twice in one block (across all its rows).
+- Each row is a uniform random sample, without replacement, of the numbers its rule allows that the earlier
+  rows have not taken. The random rows sample everything that is left.
+- `two` and `three` come back as one inner array per row, and every row holds exactly `perRow` numbers, so the
+  rows of the card never shift (`top`, `drill` and `win` stay flat lists). `row` is validated to 0..6 and `perRow`
+  to 1..6, and the smallest pool of a rule row is 9 numbers (row 1 or 2 of 2 ตัว with `isDouble` off, 10 with it
+  on), so every allowed `perRow` fits and nothing is ever padded. If a direct caller of `generateCardNumbers` asks
+  for a `perRow` above a rule row's pool (above 9, or 10 with `isDouble`), the row keeps its whole pool and the
+  missing slots are topped up with unused numbers of any kind (the switches and the no-repeat rule still apply).
+  A block that asks for more numbers than exist (above 90 / 100 two-digit, 990 / 1000 three-digit) comes back short.
+- เลขเด่น (`single`): 2 digits (the default) is r1 followed by r2, so r1 = 8 and r2 = 1 give `81` (never a double,
+  `isDouble` does not matter); 1 digit is one of the running digits at random; 3 digits is a random 3-digit number
+  containing r1 or r2 (a triple only with `allowTriple`). A valid `fixedSingle` (digits only, exactly `singleDigits`
+  long) always wins.
+- `top` (cycles r1, r2), `drill` (one prefix digit from `drillPrefixFrom`, at most 9 numbers) and `win` (distinct
+  digits that include the running or top digits) are unchanged. With `drillPrefixFrom: "two"` the prefix is the first
+  digit of the first 2 ตัว number, which is now r1 (r1 or r2 when 2 ตัว has a single row).
+- `runningDouble` is a display-only card setting (optional boolean, default false): the card draws each running digit
+  twice, `8 - 1` becomes `88 - 11`. It is validated and stored with the other card settings (`PUT /settings`,
+  `PUT /settings/:lotteryId`, and the `settings` override of `POST /render/numbers`); the generator ignores it, so the
+  running digits and every number are the same with it on or off.
 
 ## v2 additions (2026-11-07)
 

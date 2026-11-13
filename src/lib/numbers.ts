@@ -1,15 +1,22 @@
 // Number-generation rules for the lottery hint cards (SPEC.md "Card anatomy").
-// Server-side port of the mockup's numbergen-web/src/lib/numbers.ts — same behaviour:
+// Server-side port of the mockup's numbergen-web/src/lib/numbers.ts; the 2 ตัว / 3 ตัว / เลขเด่น
+// rules below replace the mockup's "contains a running digit" rule. Running digits are r1, r2.
 //  - running: two distinct single digits (either may be fixed)
 //  - top: row*perRow tokens cycling running[0], running[1]
-//  - two / three: unique numbers that each contain at least one running digit
-//    (doubles only with isDouble, triples only with allowTriple)
+//  - two (2 ตัว): `row` rows of exactly `perRow` unique 2-digit numbers, no number twice in the block
+//      1 row:    every number starts with r1 or r2
+//      2+ rows:  row 1 starts with r1, row 2 starts with r2, rows 3+ are any 2-digit number (00-99)
+//  - three (3 ตัว): same shape with 3-digit numbers and "contains" instead of "starts with"
+//      1 row:    every number contains r1 or r2 (any position)
+//      2+ rows:  row 1 contains r1, row 2 contains r2, rows 3+ are any 3-digit number (000-999)
+//    isDouble (two) / allowTriple (three) decide whether 00..99 / 000..999 may appear, in every row
 //  - drill: row*perRow 2-digit numbers sharing one prefix digit (from running1/running2/top/two),
 //    unique, so at most 9 (the prefix followed by each other digit)
 //  - win: rows of `digitCount` distinct digits that must include the running (or top) digits
-//  - single (เลขเด่น): one 1/2/3-digit number — a running digit, or one number from the two/three
-//    pool — unless fixedSingle locks it
+//  - single (เลขเด่น): one 1/2/3-digit number unless fixedSingle locks it — 1 digit: a running
+//    digit; 2 digits: r1 followed by r2; 3 digits: a number containing a running digit
 // The only shape change: two/three are returned as one inner array per row (API.md CardNumbers).
+// runningDouble (draw each running digit twice) is display only and is not read here.
 import type { CardNumbers, CardSettings, DrillPrefixFrom, WinInclude } from '../types'
 
 export type Digit = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
@@ -63,45 +70,148 @@ export function pickRunning(fixed?: [number | undefined, number | undefined]): [
   return [d1, d2]
 }
 
-/** Unique 2-digit strings containing at least one running digit. */
-export function genTwo(count: number, running: [Digit, Digit], opts?: { isDouble?: boolean }): string[] {
-  const isDouble = opts?.isDouble ?? false
-  const [r1, r2] = running
-  const pool: string[] = []
-  for (let a = 0; a <= 9; a++) {
-    for (let b = 0; b <= 9; b++) {
-      if (a !== r1 && a !== r2 && b !== r1 && b !== r2) continue
-      if (!isDouble && a === b) continue
-      pool.push(`${a}${b}`)
-    }
-  }
-  return shuffle(pool).slice(0, Math.max(0, Math.min(count, pool.length)))
+// ---- 2 ตัว / 3 ตัว blocks ---------------------------------------------------------------------
+
+/**
+ * What a row rule looks at in each number, looked up by the number's integer value ("07" is 7,
+ * "007" is 7). 2-digit numbers: the bit of the first digit, so a rule means "starts with". 3-digit
+ * numbers: the bits of every digit it holds, so a rule means "contains" ("007" holds 0 and 7).
+ * A rule is a mask of digits (bit d = digit d); a number passes when its profile shares a bit.
+ */
+const PROFILE: Record<2 | 3, Uint16Array> = { 2: new Uint16Array(100), 3: new Uint16Array(1000) }
+for (let n = 0; n < 100; n++) PROFILE[2][n] = 1 << Math.floor(n / 10)
+for (let n = 0; n < 1000; n++) {
+  PROFILE[3][n] = (1 << Math.floor(n / 100)) | (1 << (Math.floor(n / 10) % 10)) | (1 << (n % 10))
+}
+/** A rule every number passes (rows 3 and beyond, top-ups). */
+const ANY_DIGIT = 0x3ff
+
+/** Digit masks (see PROFILE) for the rows of a block. */
+interface BlockRules {
+  /** The row of a block that has exactly one row. */
+  only: number
+  /** Row 1 of a block with two or more rows. */
+  first: number
+  /** Row 2 of a block with two or more rows. Rows 3 and beyond take any number. */
+  second: number
 }
 
-/** Unique 3-digit strings containing at least one running digit. */
-export function genThree(count: number, running: [Digit, Digit], allowTriple = false): string[] {
-  const [r1, r2] = running
-  const pool: string[] = []
-  for (let a = 0; a <= 9; a++) {
-    for (let b = 0; b <= 9; b++) {
-      for (let c = 0; c <= 9; c++) {
-        const hasRun = a === r1 || a === r2 || b === r1 || b === r2 || c === r1 || c === r2
-        if (!hasRun) continue
-        if (!allowTriple && a === b && b === c) continue
-        pool.push(`${a}${b}${c}`)
+/**
+ * `k` distinct entries of `pool`, chosen uniformly at random and in random order (partial
+ * Fisher-Yates, so exactly min(k, pool.length) random draws). Fewer than `k` only when the pool is
+ * smaller. Reorders `pool`.
+ */
+function sampleDistinct(pool: number[], k: number): number[] {
+  const n = Math.min(k, pool.length)
+  for (let i = 0; i < n; i++) {
+    const j = i + randInt(pool.length - i)
+    const t = pool[i]
+    pool[i] = pool[j]
+    pool[j] = t
+  }
+  return pool.slice(0, n)
+}
+
+/**
+ * `rows` rows of `perRow` unique `len`-digit numbers (zero padded), one inner array per row.
+ *
+ * A one-row block follows `rules.only`. With two or more rows, row 1 follows `rules.first`, row 2
+ * `rules.second` and rows 3 and beyond take any number. Every row is a uniform random sample,
+ * without replacement, of the numbers its rule allows that no earlier row took, so no number
+ * appears twice in the block. Numbers made of one repeated digit (00..99 / 000..999) are left out
+ * of every row unless `allowRepeat`.
+ *
+ * Layout: every row holds exactly `perRow` numbers, because the web draws a row per inner array.
+ * If a rule row's pool is smaller than `perRow` the row keeps its whole pool and the missing slots
+ * are topped up with unused numbers of any kind (after every rule row has taken its own pool
+ * first, so a top-up never takes a number a later rule row needs). The smallest rule pool is 9
+ * numbers ("starts with r1" with doubles off; 10 with them on) and the API only accepts
+ * perRow 1..6, so this only happens for direct callers with perRow above 9 / 10. A block asked
+ * for more numbers than exist (above 90 / 100 two-digit, 990 / 1000 three-digit) ends up short;
+ * empty trailing rows are dropped.
+ */
+function genBlock(
+  len: 2 | 3,
+  rows: number,
+  perRow: number,
+  allowRepeat: boolean,
+  rules: BlockRules,
+): string[][] {
+  const profile = PROFILE[len]
+  const size = profile.length
+  const per = Number.isFinite(perRow) ? Math.max(1, Math.trunc(perRow)) : 1
+  const rowCount = Number.isFinite(rows) ? Math.min(Math.max(0, Math.trunc(rows)), Math.ceil(size / per)) : 0
+  // 00 11 .. 99 are the multiples of 11, 000 111 .. 999 the multiples of 111.
+  const repeated = (size - 1) / 9
+  const used = new Uint8Array(size)
+  /** Every number passing `mask` that no row has taken (nor a repeated-digit one unless allowed). */
+  const pool = (mask: number): number[] => {
+    const out: number[] = []
+    for (let n = 0; n < size; n++) {
+      if (used[n] === 0 && (profile[n] & mask) !== 0 && (allowRepeat || n % repeated !== 0)) out.push(n)
+    }
+    return out
+  }
+
+  const masks = rowCount === 1 ? [rules.only] : [rules.first, rules.second]
+  const picked: number[][] = []
+  for (let r = 0; r < rowCount; r++) {
+    const row = r < masks.length ? sampleDistinct(pool(masks[r]), per) : []
+    for (const n of row) used[n] = 1
+    picked.push(row)
+  }
+
+  // Rows 3+ (and any rule row whose pool ran out) are filled from what no row has taken.
+  let missing = 0
+  for (const row of picked) missing += per - row.length
+  if (missing > 0) {
+    const extra = sampleDistinct(pool(ANY_DIGIT), missing)
+    let at = 0
+    for (const row of picked) {
+      const room = per - row.length
+      if (room > 0) {
+        row.push(...extra.slice(at, at + room))
+        at += room
       }
     }
   }
-  const need = Math.max(0, Math.min(count, pool.length))
-  const result: string[] = []
-  const used = new Set<number>()
-  while (result.length < need) {
-    const idx = randInt(pool.length)
-    if (used.has(idx)) continue
-    used.add(idx)
-    result.push(pool[idx])
-  }
-  return result
+  return picked.filter((row) => row.length > 0).map((row) => row.map((n) => String(n).padStart(len, '0')))
+}
+
+/**
+ * The 2 ตัว block: `rows` x `perRow` unique 2-digit numbers (rows 1 / 2 start with r1 / r2, or
+ * with either when there is a single row; later rows are any number). See genBlock.
+ */
+export function genTwo(
+  rows: number,
+  perRow: number,
+  running: [Digit, Digit],
+  opts?: { isDouble?: boolean },
+): string[][] {
+  const [r1, r2] = running
+  return genBlock(2, rows, perRow, opts?.isDouble ?? false, {
+    only: (1 << r1) | (1 << r2),
+    first: 1 << r1,
+    second: 1 << r2,
+  })
+}
+
+/**
+ * The 3 ตัว block: `rows` x `perRow` unique 3-digit numbers (rows 1 / 2 contain r1 / r2 in any
+ * position, or one of them when there is a single row; later rows are any number). See genBlock.
+ */
+export function genThree(
+  rows: number,
+  perRow: number,
+  running: [Digit, Digit],
+  opts?: { allowTriple?: boolean },
+): string[][] {
+  const [r1, r2] = running
+  return genBlock(3, rows, perRow, opts?.allowTriple ?? false, {
+    only: (1 << r1) | (1 << r2),
+    first: 1 << r1,
+    second: 1 << r2,
+  })
 }
 
 /**
@@ -143,7 +253,7 @@ export interface GenerateInput {
   drill?: { row: number; perRow?: number; prefixFrom?: DrillPrefixFrom }
   win?: { row: number; digitCount?: number; include?: WinInclude }
   fixed?: [number | undefined, number | undefined]
-  single?: { digits?: number; fixed?: string | null; isDouble?: boolean; allowTriple?: boolean }
+  single?: { digits?: number; fixed?: string | null; allowTriple?: boolean }
 }
 
 /** A fixed เลขเด่น counts only when it is all digits and exactly `digits` long. */
@@ -152,24 +262,14 @@ export function parseFixedSingle(v: unknown, digits: number): string | undefined
 }
 
 /**
- * One เลขเด่น of `digits` (1..3) digits. 1 = one of the running digits; 2/3 = one number from the
- * same pool as genTwo/genThree (contains a running digit; isDouble/allowTriple respected).
+ * One เลขเด่น of `digits` (1..3) digits (the caller handles a fixed value). 1 = one of the running
+ * digits; 2 = r1 followed by r2 (always, so never a double and isDouble does not matter); 3 = one
+ * number containing r1 or r2 in any position (the one-row 3 ตัว pool; triples only with allowTriple).
  */
-export function genSingle(
-  digits: number,
-  running: [Digit, Digit],
-  opts?: { isDouble?: boolean; allowTriple?: boolean },
-): string {
+export function genSingle(digits: number, running: [Digit, Digit], opts?: { allowTriple?: boolean }): string {
   if (digits === 1) return String(pick(running))
-  if (digits === 3) return genThree(1, running, opts?.allowTriple)[0]
-  return genTwo(1, running, { isDouble: opts?.isDouble })[0]
-}
-
-function chunk(arr: string[], size: number): string[][] {
-  const per = Math.max(1, size)
-  const out: string[][] = []
-  for (let i = 0; i < arr.length; i += per) out.push(arr.slice(i, i + per))
-  return out
+  if (digits === 3) return genThree(1, 1, running, { allowTriple: opts?.allowTriple })[0][0]
+  return `${running[0]}${running[1]}`
 }
 
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
@@ -180,13 +280,10 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
 export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
   const running = pickRunning(cfg.fixed)
 
-  const twoPer = Math.max(1, cfg.two?.perRow ?? 1)
-  const twoCount = (cfg.two?.row ?? 0) * twoPer
-  const twoFlat = twoCount > 0 ? genTwo(twoCount, running, { isDouble: cfg.two?.isDouble }) : []
-
-  const threePer = Math.max(1, cfg.three?.perRow ?? 1)
-  const threeCount = (cfg.three?.row ?? 0) * threePer
-  const threeFlat = threeCount > 0 ? genThree(threeCount, running, cfg.three?.allowTriple) : []
+  const two = genTwo(cfg.two?.row ?? 0, cfg.two?.perRow ?? 1, running, { isDouble: cfg.two?.isDouble })
+  const three = genThree(cfg.three?.row ?? 0, cfg.three?.perRow ?? 1, running, {
+    allowTriple: cfg.three?.allowTriple,
+  })
 
   const topCount = (cfg.top?.row ?? 0) * (cfg.top?.perRow ?? 0)
   const top: string[] = []
@@ -199,7 +296,7 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
   let prefixDigit: number = running[0]
   if (prefixFrom === 'running2') prefixDigit = running[1]
   if (prefixFrom === 'top' && top.length) prefixDigit = Number(top[0])
-  if (prefixFrom === 'two' && twoFlat.length) prefixDigit = Number(twoFlat[0][0])
+  if (prefixFrom === 'two' && two.length) prefixDigit = Number(two[0][0][0])
   const drill = drillCount > 0 ? genDrill(drillCount, prefixDigit) : []
 
   const winRows = cfg.win?.row ?? 0
@@ -217,13 +314,13 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
   const singleDigits = clampInt(cfg.single?.digits, 1, 3, 2)
   const single =
     parseFixedSingle(cfg.single?.fixed, singleDigits) ??
-    genSingle(singleDigits, running, { isDouble: cfg.single?.isDouble, allowTriple: cfg.single?.allowTriple })
+    genSingle(singleDigits, running, { allowTriple: cfg.single?.allowTriple })
 
   return {
     running: [String(running[0]), String(running[1])],
     top,
-    two: chunk(twoFlat, twoPer),
-    three: chunk(threeFlat, threePer),
+    two,
+    three,
     drill,
     win,
     single,
@@ -266,11 +363,7 @@ export function generateForSettings(
     drill: { row: rowOf('drill', 2), perRow: perOf('drill', 3), prefixFrom: s.drillPrefixFrom },
     win: { row: rowOf('win', 1), digitCount: clampInt(s.winDigitCount, 2, 7, 6), include: s.winInclude },
     fixed: [f1 ?? s1, f2 ?? s2],
-    single: {
-      digits: s.singleDigits,
-      fixed: s.fixedSingle,
-      isDouble: s.isDouble === true,
-      allowTriple: s.allowTriple === true,
-    },
+    // s.runningDouble is display only (the card draws each running digit twice); it changes no number.
+    single: { digits: s.singleDigits, fixed: s.fixedSingle, allowTriple: s.allowTriple === true },
   })
 }
