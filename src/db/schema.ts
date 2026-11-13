@@ -49,6 +49,13 @@ export const lotteries = sqliteTable(
     active: integer('active', { mode: 'boolean' }).notNull().default(true),
     /** NULL = global catalog (admin-managed). Otherwise private to that member. */
     ownerMemberId: text('owner_member_id'),
+    /**
+     * Admin default "เวลาลง" for a catalog lottery: "HH:MM" in Asia/Bangkok, NULL = no time set.
+     * Members without their own member_notifications row follow it. Unused for private lotteries.
+     */
+    notifyTime: text('notify_time'),
+    /** Admin default on/off, paired with notifyTime. A catalog lottery is never "on" without a time. */
+    notifyEnabled: integer('notify_enabled', { mode: 'boolean' }).notNull().default(false),
   },
   (t) => [index('lotteries_owner_idx').on(t.ownerMemberId)],
 )
@@ -182,3 +189,57 @@ export const siteSettings = sqliteTable('site_settings', {
   value: text('value').notNull(),
   updatedAt: text('updated_at').notNull(),
 })
+
+/**
+ * A member's own daily-reminder line for one lottery they can see (active catalog lottery or one
+ * of their private lotteries). When PUT /notifications is saved, every line becomes a row here;
+ * a row wins over the admin default on `lotteries` (members who never saved have no rows and
+ * follow the default). `notifyTime` is "HH:MM" in Asia/Bangkok. `lastSentDay` (Bangkok
+ * YYYY-MM-DD) is informational only; de-duplication uses the cursor in site_settings.
+ * Deleted explicitly with the member / the lottery (see admin.ts, lotteries.ts).
+ */
+export const memberNotifications = sqliteTable(
+  'member_notifications',
+  {
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id, { onDelete: 'cascade' }),
+    lotteryId: text('lottery_id')
+      .notNull()
+      .references(() => lotteries.id, { onDelete: 'cascade' }),
+    notifyTime: text('notify_time'),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull(),
+    lastSentDay: text('last_sent_day'),
+    updatedAt: text('updated_at').notNull(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.memberId, t.lotteryId] }),
+    // Serves the scheduled job: enabled lines whose time is one of the minutes being processed.
+    index('member_notifications_due_idx').on(t.enabled, t.notifyTime),
+    // Serves the lottery-scoped cascade on lottery delete (member / admin) without a full scan.
+    index('member_notifications_lottery_idx').on(t.lotteryId),
+  ],
+)
+
+/**
+ * Web Push subscriptions (one row per browser / device). `endpoint` is unique: registering an
+ * endpoint that belongs to another member re-assigns it. The scheduled job deletes rows whose
+ * push service answers 404 / 410. Deleted explicitly with the member (see admin.ts).
+ */
+export const pushSubscriptions = sqliteTable(
+  'push_subscriptions',
+  {
+    id: text('id').primaryKey(),
+    memberId: text('member_id')
+      .notNull()
+      .references(() => members.id, { onDelete: 'cascade' }),
+    endpoint: text('endpoint').notNull().unique(),
+    /** base64url, 65-byte uncompressed P-256 point. */
+    p256dh: text('p256dh').notNull(),
+    /** base64url, 16-byte authentication secret. */
+    auth: text('auth').notNull(),
+    /** Time of the latest (re-)registration; the device cap drops the smallest values first. */
+    createdAt: text('created_at').notNull(),
+  },
+  (t) => [index('push_subscriptions_member_idx').on(t.memberId)],
+)

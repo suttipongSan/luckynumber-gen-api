@@ -1,7 +1,7 @@
 // NumberGen API — Hono on Cloudflare Workers.
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import type { AppEnv } from './types'
+import type { AppEnv, Bindings } from './types'
 import { API_VERSION } from './types'
 import { ApiError, errorJson, errors } from './lib/http'
 import { linkRoutes } from './routes/link'
@@ -14,7 +14,10 @@ import { setRoutes } from './routes/sets'
 import { settingsRoutes } from './routes/settings'
 import { renderRoutes } from './routes/render'
 import { assetRoutes } from './routes/assets'
+import { notificationRoutes } from './routes/notifications'
+import { pushRoutes } from './routes/push'
 import { adminRoutes } from './routes/admin'
+import { runScheduledReminders } from './lib/reminders'
 
 const DEV_ORIGIN = 'http://localhost:5173'
 
@@ -76,6 +79,8 @@ app.route('/', setRoutes)
 app.route('/', settingsRoutes)
 app.route('/', renderRoutes)
 app.route('/', assetRoutes)
+app.route('/', notificationRoutes)
+app.route('/', pushRoutes)
 app.route('/admin', adminRoutes)
 
 app.notFound((c) => c.json({ error: { code: 'NOT_FOUND', message: 'ไม่พบเส้นทางนี้' } }, 404))
@@ -86,4 +91,23 @@ app.onError((err, c) => {
   return c.json({ error: { code: 'INTERNAL', message: 'เกิดข้อผิดพลาดภายในระบบ' } }, 500)
 })
 
-export default app
+/**
+ * Cloudflare cron trigger (wrangler.toml [triggers], every minute): sends the daily reminders that
+ * are due. Does nothing until the VAPID keys are configured. A thrown error is logged and
+ * rethrown so the failed run shows up in the Workers dashboard.
+ */
+export async function scheduled(controller: { scheduledTime: number }, env: Bindings): Promise<void> {
+  try {
+    // scheduledTime is the minute the trigger was due; never run behind it, so a trigger that
+    // fires a moment early still handles its own minute.
+    await runScheduledReminders(env, Math.max(Date.now(), controller.scheduledTime))
+  } catch (err) {
+    console.error('scheduled reminders failed', err)
+    throw err
+  }
+}
+
+// Workers call default.fetch and default.scheduled. The Hono app already has fetch; adding
+// scheduled to that same object keeps `import app from './index'` (app.request in the tests)
+// working.
+export default Object.assign(app, { scheduled })

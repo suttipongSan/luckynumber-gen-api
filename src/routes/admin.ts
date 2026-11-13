@@ -9,10 +9,12 @@ import {
   cardSettings,
   loginAttempts,
   lotteries,
+  memberNotifications,
   memberSessions,
   members,
   news,
   newsReads,
+  pushSubscriptions,
   renderCounters,
   setLotteries,
   sets,
@@ -20,6 +22,7 @@ import {
 } from '../db/schema'
 import { requireAdmin } from '../middleware/adminAuth'
 import { errors, parseJson } from '../lib/http'
+import { chunk } from '../lib/chunk'
 import { timingSafeEqualStr, verifyPassword } from '../lib/crypto'
 import {
   endAdminSession,
@@ -48,13 +51,14 @@ import {
   type SiteSettingKey,
 } from '../lib/siteSettings'
 import { bangkokDay, nowIso, toIso } from '../lib/time'
-import { rendersTodayFor, rendersTodayMap, toAdminMember, toLottery } from '../lib/views'
+import { rendersTodayFor, rendersTodayMap, toAdminLottery, toAdminMember } from '../lib/views'
 import {
   adminLoginSchema,
   adminSettingsSchema,
   createMemberSchema,
   lotterySchema,
   newsSchema,
+  notificationsSchema,
   patchLotterySchema,
   patchMemberSchema,
   patchNewsSchema,
@@ -233,8 +237,9 @@ adminRoutes.delete('/members/:id', async (c) => {
   const row = await db.query.members.findFirst({ where: eq(members.id, id) })
   if (!row) throw errors.notFound('ไม่พบสมาชิก')
   const setIds = db.select({ id: sets.id }).from(sets).where(eq(sets.memberId, id))
-  // F5: also drop this member's custom lotteries and the set_lotteries / card_settings rows that
-  // reference them (across all members, defence in depth — only this member can create them).
+  // F5: also drop this member's custom lotteries and the set_lotteries / card_settings /
+  // member_notifications rows that reference them (across all members, defence in depth — only
+  // this member can create them). The member's own reminder lines and push devices go too.
   const customLotteryIds = db
     .select({ id: lotteries.id })
     .from(lotteries)
@@ -251,6 +256,9 @@ adminRoutes.delete('/members/:id', async (c) => {
     db.delete(assets).where(eq(assets.memberId, id)).returning({ r2Key: assets.r2Key }),
     db.delete(newsReads).where(eq(newsReads.memberId, id)),
     db.delete(renderCounters).where(eq(renderCounters.memberId, id)),
+    db.delete(memberNotifications).where(eq(memberNotifications.memberId, id)),
+    db.delete(memberNotifications).where(inArray(memberNotifications.lotteryId, customLotteryIds)),
+    db.delete(pushSubscriptions).where(eq(pushSubscriptions.memberId, id)),
     db.delete(memberSessions).where(eq(memberSessions.memberId, id)),
     db.delete(lotteries).where(eq(lotteries.ownerMemberId, id)),
     db.delete(members).where(eq(members.id, id)),
@@ -301,12 +309,20 @@ adminRoutes.get('/lotteries', async (c) => {
     .from(lotteries)
     .where(isNull(lotteries.ownerMemberId))
     .orderBy(asc(lotteries.sortOrder), asc(lotteries.name))
-  return c.json(rows.map((r) => toLottery(r)))
+  return c.json(rows.map(toAdminLottery))
 })
+
+/** A catalog lottery cannot have its reminder switched on without a time. */
+function checkNotifyState(time: string | null, enabled: boolean) {
+  if (enabled && time === null) throw errors.validation('ต้องระบุเวลาก่อนเปิดแจ้งเตือน')
+}
 
 adminRoutes.post('/lotteries', async (c) => {
   const db = getDb(c.env)
   const body = await parseJson(c, lotterySchema)
+  const notifyTime = body.notifyTime ?? null
+  const notifyEnabled = body.notifyEnabled ?? false
+  checkNotifyState(notifyTime, notifyEnabled)
   const row = {
     id: newId(),
     name: body.name,
@@ -316,9 +332,11 @@ adminRoutes.post('/lotteries', async (c) => {
     sortOrder: body.sortOrder,
     active: body.active,
     ownerMemberId: null,
+    notifyTime,
+    notifyEnabled,
   }
   await db.insert(lotteries).values(row)
-  return c.json(toLottery(row))
+  return c.json(toAdminLottery(row))
 })
 
 adminRoutes.patch('/lotteries/:id', async (c) => {
@@ -332,6 +350,20 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
   if (body.accent !== undefined) patch.accent = body.accent
   if (body.sortOrder !== undefined) patch.sortOrder = body.sortOrder
   if (body.active !== undefined) patch.active = body.active
+  if (body.notifyTime !== undefined) patch.notifyTime = body.notifyTime
+  if (body.notifyEnabled !== undefined) patch.notifyEnabled = body.notifyEnabled
+  if (body.notifyTime !== undefined || body.notifyEnabled !== undefined) {
+    // Check the state the lottery will be in, not only the fields that were sent (e.g. clearing
+    // the time of a lottery whose reminder is on).
+    const current = await db.query.lotteries.findFirst({
+      where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
+    })
+    if (!current) throw errors.notFound('ไม่พบหวย')
+    checkNotifyState(
+      body.notifyTime !== undefined ? body.notifyTime : current.notifyTime,
+      body.notifyEnabled !== undefined ? body.notifyEnabled : current.notifyEnabled,
+    )
+  }
   if (Object.keys(patch).length) {
     await db
       .update(lotteries)
@@ -342,7 +374,7 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
     where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
   })
   if (!row) throw errors.notFound('ไม่พบหวย')
-  return c.json(toLottery(row))
+  return c.json(toAdminLottery(row))
 })
 
 adminRoutes.delete('/lotteries/:id', async (c) => {
@@ -355,9 +387,56 @@ adminRoutes.delete('/lotteries/:id', async (c) => {
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.lotteryId, id)),
     db.delete(cardSettings).where(eq(cardSettings.lotteryId, id)),
+    db.delete(memberNotifications).where(eq(memberNotifications.lotteryId, id)),
     db.delete(lotteries).where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId))),
   ])
   return c.body(null, 204)
+})
+
+// ---- default daily reminders ("เวลาลง") of the catalog lotteries
+
+// One UPDATE per chunk using CASE: each lottery binds 5 parameters (id + time in the time CASE,
+// id + flag in the enabled CASE, id in the IN list), so 18 lotteries = 90 of D1's 100 per
+// statement, and a whole catalog is a handful of statements instead of one per lottery.
+const DEFAULTS_PER_UPDATE = 18
+
+adminRoutes.put('/notifications', async (c) => {
+  const db = getDb(c.env)
+  const body = await parseJson(c, notificationsSchema)
+  // Only catalog lotteries (owner_member_id IS NULL) have an admin default; inactive ones may be
+  // prepared before they are switched on. A member's private lottery id counts as unknown here.
+  const known = new Set(
+    (await db.select({ id: lotteries.id }).from(lotteries).where(isNull(lotteries.ownerMemberId))).map(
+      (r) => r.id,
+    ),
+  )
+  const unknown = body.items.map((it) => it.lotteryId).filter((id) => !known.has(id))
+  if (unknown.length) throw errors.validation(`ไม่พบหวย: ${unknown.slice(0, 5).join(', ')}`)
+  const stmts = chunk(body.items, DEFAULTS_PER_UPDATE).map((part) =>
+    db
+      .update(lotteries)
+      .set({
+        notifyTime: sql`case ${lotteries.id} ${sql.join(
+          part.map((it) => sql`when ${it.lotteryId} then ${it.notifyTime}`),
+          sql` `,
+        )} end`,
+        notifyEnabled: sql`case ${lotteries.id} ${sql.join(
+          part.map((it) => sql`when ${it.lotteryId} then ${it.enabled ? 1 : 0}`),
+          sql` `,
+        )} end`,
+      })
+      .where(
+        and(
+          inArray(
+            lotteries.id,
+            part.map((it) => it.lotteryId),
+          ),
+          isNull(lotteries.ownerMemberId),
+        ),
+      ),
+  )
+  if (stmts.length) await db.batch(stmts as [(typeof stmts)[number], ...(typeof stmts)[number][]])
+  return c.json({ ok: true })
 })
 
 // ---- news

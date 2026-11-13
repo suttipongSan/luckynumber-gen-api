@@ -20,6 +20,26 @@ export function base64ToBytes(b64: string): Uint8Array {
   return out
 }
 
+/** URL-safe base64 without padding (RFC 4648 section 5); the encoding of Web Push / VAPID keys. */
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return bytesToBase64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/**
+ * Strict base64url decoder. Returns null for anything outside the base64url alphabet or with an
+ * impossible length; trailing `=` padding is tolerated.
+ */
+export function base64UrlToBytes(value: string): Uint8Array | null {
+  const s = value.replace(/=+$/, '')
+  if (!/^[A-Za-z0-9_-]*$/.test(s) || s.length % 4 === 1) return null
+  try {
+    const padded = s.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (s.length % 4)) % 4)
+    return base64ToBytes(padded)
+  } catch {
+    return null
+  }
+}
+
 export function bytesToHex(bytes: Uint8Array): string {
   let s = ''
   for (const b of bytes) s += b.toString(16).padStart(2, '0')

@@ -5,7 +5,7 @@ import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import type { AppEnv, Lottery } from '../types'
 import { MAX_CUSTOM_LOTTERIES } from '../types'
 import { getDb } from '../db/client'
-import { cardSettings, lotteries, setLotteries } from '../db/schema'
+import { cardSettings, lotteries, memberNotifications, setLotteries } from '../db/schema'
 import { GROUP_ORDER } from '../db/catalog'
 import { requireMember } from '../middleware/memberAuth'
 import { changedRows, errors, parseJson } from '../lib/http'
@@ -138,10 +138,12 @@ lotteryRoutes.delete('/lotteries/:id', async (c) => {
   const id = c.req.param('id')
   const row = await ownedLottery(db, memberId, id)
   // Cascade manually so another member's sets / settings referencing this lottery (which cannot
-  // happen through the member API) are also cleaned up, as a defence in depth.
+  // happen through the member API) are also cleaned up, as a defence in depth. The reminder
+  // lines for this lottery go with it.
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.lotteryId, row.id)),
     db.delete(cardSettings).where(eq(cardSettings.lotteryId, row.id)),
+    db.delete(memberNotifications).where(eq(memberNotifications.lotteryId, row.id)),
     db
       .delete(lotteries)
       .where(and(eq(lotteries.id, row.id), eq(lotteries.ownerMemberId, memberId))),

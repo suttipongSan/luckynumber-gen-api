@@ -22,6 +22,7 @@ export const errors = {
   validation: (m = 'ข้อมูลไม่ถูกต้อง') => new ApiError(400, 'VALIDATION', m),
   rateLimited: (m = 'เรียกใช้งานเกินกำหนด') => new ApiError(429, 'RATE_LIMITED', m),
   conflict: (code = 'CONFLICT', m = 'ข้อมูลขัดแย้ง') => new ApiError(409, code, m),
+  unavailable: (code = 'UNAVAILABLE', m = 'ระบบยังไม่พร้อมใช้งาน') => new ApiError(503, code, m),
 }
 
 /**

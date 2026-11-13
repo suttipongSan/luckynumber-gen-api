@@ -23,3 +23,11 @@ WEB_URL=http://localhost:5173
 
 # 'true' in production (Secure; SameSite=None cookies), 'false' for local http dev (SameSite=Lax).
 COOKIE_SECURE=false
+
+# Web Push for the daily reminders. `npm run vapid:generate` prints a key pair (it writes no file).
+# In production set both with `npx wrangler secret put <NAME>`. Without both keys the reminders are off:
+# GET /push/key answers 503 and the cron trigger does nothing.
+# VAPID_PUBLIC_KEY=
+# VAPID_PRIVATE_KEY=
+# Optional contact for the push services (mailto: or https: URL). Default: https://pnphoto.co
+# VAPID_SUBJECT=mailto:you@example.com

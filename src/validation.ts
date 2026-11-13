@@ -2,7 +2,8 @@
 // bounds from API.md are enforced (rows 0..6, perRow 1..6, fontSize 8..400, colours ≤ 40 chars,
 // whole document ≤ 32 KB).
 import { z } from 'zod'
-import { GROUPS, MAX_ROUND, MIN_ROUND } from './types'
+import { GROUPS, MAX_NOTIFICATION_ITEMS, MAX_ROUND, MIN_ROUND } from './types'
+import { decodeAuthSecret, decodeP256dh, MAX_ENDPOINT_LENGTH, parsePushEndpoint } from './lib/webpush'
 
 export const MAX_SETTINGS_BYTES = 32 * 1024
 
@@ -224,6 +225,10 @@ export const adminSettingsSchema = z.object({
   renderLimitDefault: z.number().int().min(1).max(100_000),
 })
 
+// Daily reminder time of a lottery: "HH:MM" (00:00..23:59, zero padded), Asia/Bangkok.
+export const NOTIFY_TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/
+const notifyTime = z.string().regex(NOTIFY_TIME_RE, 'เวลาต้องอยู่ในรูปแบบ HH:MM (00:00-23:59)')
+
 export const lotterySchema = z.object({
   name: z.string().trim().min(1).max(80),
   shortName: z.string().trim().min(1).max(60),
@@ -231,6 +236,9 @@ export const lotterySchema = z.object({
   accent: color,
   sortOrder: z.number().int().min(-1_000_000).max(1_000_000),
   active: z.boolean(),
+  // Admin default reminder. Optional on create and on patch; null clears the time.
+  notifyTime: notifyTime.nullable().optional(),
+  notifyEnabled: z.boolean().optional(),
 })
 export const patchLotterySchema = lotterySchema.partial()
 
@@ -252,3 +260,57 @@ export const newsSchema = z.object({
   active: z.boolean(),
 })
 export const patchNewsSchema = newsSchema.partial()
+
+// PUT /notifications (member) and PUT /admin/notifications (admin catalog defaults): the same
+// body. A line that is on needs a time. The ids must be unique; whether the lotteries exist and
+// may be used is checked against the database by the routes.
+const notificationLine = z
+  .object({
+    lotteryId: z.string().min(1).max(64),
+    notifyTime: notifyTime.nullable(),
+    enabled: z.boolean(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.enabled && val.notifyTime === null) {
+      ctx.addIssue({ code: 'custom', path: ['notifyTime'], message: 'ต้องระบุเวลาเมื่อเปิดแจ้งเตือน' })
+    }
+  })
+
+export const notificationsSchema = z
+  .object({ items: z.array(notificationLine).max(MAX_NOTIFICATION_ITEMS) })
+  .superRefine((val, ctx) => {
+    const seen = new Set<string>()
+    const dups: string[] = []
+    for (const it of val.items) {
+      if (seen.has(it.lotteryId)) {
+        if (!dups.includes(it.lotteryId) && dups.length < 5) dups.push(it.lotteryId)
+      } else {
+        seen.add(it.lotteryId)
+      }
+    }
+    if (dups.length) {
+      ctx.addIssue({ code: 'custom', message: `lotteryId ซ้ำ: ${dups.join(', ')}` })
+    }
+  })
+
+// POST /push/subscribe: the PushSubscription JSON of the browser. The endpoint must be an https
+// URL on a known push service (the Worker POSTs to it later), and the keys must decode to the
+// right sizes. (Whether the p256dh is a real curve point is checked asynchronously by the route.)
+export const pushSubscribeSchema = z.object({
+  endpoint: z
+    .string()
+    .max(MAX_ENDPOINT_LENGTH)
+    .refine((v) => parsePushEndpoint(v) !== null, 'ต้องเป็น URL https ของบริการ Push ที่รองรับ'),
+  keys: z.object({
+    p256dh: z
+      .string()
+      .max(200)
+      .refine((v) => decodeP256dh(v) !== null, 'p256dh ต้องเป็น base64url ของจุด P-256 ขนาด 65 ไบต์'),
+    auth: z
+      .string()
+      .max(100)
+      .refine((v) => decodeAuthSecret(v) !== null, 'auth ต้องเป็น base64url ขนาด 16 ไบต์'),
+  }),
+})
+
+export const pushUnsubscribeSchema = z.object({ endpoint: z.string().min(1).max(MAX_ENDPOINT_LENGTH) })

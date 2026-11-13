@@ -2,7 +2,7 @@
 import { and, eq, inArray, isNull, or } from 'drizzle-orm'
 import type { DB } from '../db/client'
 import { lotteries, renderCounters, type members } from '../db/schema'
-import type { AdminMember, Group, Lottery, Member, SessionMember } from '../types'
+import type { AdminLottery, AdminMember, Group, Lottery, Member, SessionMember } from '../types'
 import { effectiveRenderLimit } from './siteSettings'
 import { isExpired, bangkokDay } from './time'
 import { chunk, IN_CHUNK } from './chunk'
@@ -13,9 +13,9 @@ type LotteryRow = typeof lotteries.$inferSelect
 /**
  * Maps a lottery row to the API shape. Pass the requesting `memberId` to set `custom: true`
  * when the lottery is owned by that member. Admin / public callers omit the id and get
- * `custom: false`.
+ * `custom: false`. The reminder columns are not part of the member shape (see toAdminLottery).
  */
-export function toLottery(r: LotteryRow, memberId?: string): Lottery {
+export function toLottery(r: Omit<LotteryRow, 'notifyTime' | 'notifyEnabled'>, memberId?: string): Lottery {
   return {
     id: r.id,
     name: r.name,
@@ -26,6 +26,11 @@ export function toLottery(r: LotteryRow, memberId?: string): Lottery {
     active: r.active,
     custom: memberId !== undefined && r.ownerMemberId === memberId,
   }
+}
+
+/** Back office shape: the lottery plus its default daily reminder (`GET /admin/lotteries`). */
+export function toAdminLottery(r: LotteryRow): AdminLottery {
+  return { ...toLottery(r), notifyTime: r.notifyTime, notifyEnabled: r.notifyEnabled }
 }
 
 export function toMember(

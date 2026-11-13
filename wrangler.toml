@@ -9,7 +9,9 @@ routes = [{ pattern = "api.pnphoto.co", custom_domain = true }]
 workers_dev = false
 
 # Non-secret configuration. For local dev, .dev.vars overrides these values.
-# Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH) are set with `wrangler secret put <NAME>`.
+# Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and the Web Push keys
+# VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY from `npm run vapid:generate`) are set with `wrangler secret put <NAME>`.
+# Optional var VAPID_SUBJECT (a mailto: or https: contact URL for the push services; default https://pnphoto.co).
 [vars]
 # First origin is used in member links; every listed origin is allowed by CORS.
 WEB_URL = "https://pnphoto.co"
@@ -29,3 +31,8 @@ bucket_name = "numbergen-assets"
 
 [observability]
 enabled = true
+
+# Daily reminders ("เวลาลง"): src/lib/reminders.ts runs every minute and sends the Web Push messages that are
+# due. It does nothing until VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are set.
+[triggers]
+crons = ["* * * * *"]

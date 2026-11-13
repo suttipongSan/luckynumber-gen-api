@@ -36,6 +36,13 @@
       "when": 1794325634906,
       "tag": "0004_add_site_settings_and_render_limit",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794504518604,
+      "tag": "0005_add_push_reminders",
+      "breakpoints": true
     }
   ]
 }

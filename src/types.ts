@@ -16,6 +16,47 @@ export interface Lottery {
   custom: boolean
 }
 
+/**
+ * A catalog lottery as the back office sees it (`GET /admin/lotteries`): the member shape plus the
+ * default daily reminder. `notifyTime` is "HH:MM" in Asia/Bangkok; `notifyEnabled` is never true
+ * while `notifyTime` is null.
+ */
+export interface AdminLottery extends Lottery {
+  notifyTime: string | null
+  notifyEnabled: boolean
+}
+
+/**
+ * One line of `GET/PUT /notifications`: a lottery the member can see (active catalog lottery or
+ * their own) with the reminder that applies to them. `saved` = the member has their own row
+ * (their values win); otherwise the values are the admin default (catalog) or off (private).
+ */
+export interface NotificationItem {
+  lotteryId: string
+  name: string
+  groupKey: Group
+  /** True for the member's private lotteries. */
+  own: boolean
+  /** "HH:MM" in Asia/Bangkok. */
+  notifyTime: string | null
+  enabled: boolean
+  saved: boolean
+}
+
+/** `GET /push/key`. */
+export interface PushKeyResponse {
+  publicKey: string
+}
+
+/** The JSON that is encrypted into every Web Push message; the service worker shows it. */
+export interface PushPayload {
+  title: string
+  body: string
+  lotteryIds: string[]
+  /** Absolute web URL that opens the first lottery (`<web origin>/?lottery=<id>`). */
+  url: string
+}
+
 /** The member as seen by the member (`GET /me`). */
 export interface Member {
   id: string
@@ -209,6 +250,14 @@ export interface Bindings {
   WEB_URL: string
   COOKIE_SECURE?: string
   ASSETS: AssetBucket
+  /**
+   * Web Push (VAPID) keys, base64url: the 65 byte public point and the 32 byte private scalar
+   * (`npm run vapid:generate`). Without both, GET /push/key answers 503 and the cron does nothing.
+   */
+  VAPID_PUBLIC_KEY?: string
+  VAPID_PRIVATE_KEY?: string
+  /** `mailto:` or `https:` contact for the VAPID `sub` claim. Default https://pnphoto.co. */
+  VAPID_SUBJECT?: string
 }
 
 export interface MemberRow {
@@ -255,6 +304,10 @@ export const MAX_SETS = 40
 /** Max files per asset kind (background / logo / qr) per member. */
 export const MAX_ASSETS_PER_KIND = 2
 export const MAX_CUSTOM_LOTTERIES = 30
+/** Push devices (browsers) per member; registering another drops the oldest. */
+export const MAX_PUSH_DEVICES = 10
+/** Lines accepted by one PUT /notifications or PUT /admin/notifications. */
+export const MAX_NOTIFICATION_ITEMS = 500
 export const MIN_ROUND = 1
 export const MAX_ROUND = 20
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024
