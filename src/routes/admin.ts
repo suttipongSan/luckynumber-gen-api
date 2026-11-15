@@ -47,8 +47,10 @@ import {
   DEFAULTS,
   getSiteSettings,
   parseDefaultRenderLimit,
+  parseTestsiteEnabled,
   RENDER_LIMIT_DEFAULT,
   type SiteSettingKey,
+  TESTSITE_ENABLED,
 } from '../lib/siteSettings'
 import { bangkokDay, nowIso, toIso } from '../lib/time'
 import { rendersTodayFor, rendersTodayMap, toAdminLottery, toAdminMember } from '../lib/views'
@@ -63,6 +65,7 @@ import {
   patchMemberSchema,
   patchNewsSchema,
 } from '../validation'
+import { adminLandingRoutes } from './adminLanding'
 
 export const adminRoutes = new Hono<AppEnv>()
 
@@ -504,6 +507,7 @@ function toAdminSettings(map: Record<string, string>): AdminSettings {
     contactTelegramId: map[CONTACT_TELEGRAM_ID] ?? '',
     contactTelegramUrl: map[CONTACT_TELEGRAM_URL] ?? '',
     renderLimitDefault: parseDefaultRenderLimit(map[RENDER_LIMIT_DEFAULT]),
+    testsiteEnabled: parseTestsiteEnabled(map[TESTSITE_ENABLED]),
   }
 }
 
@@ -524,7 +528,12 @@ adminRoutes.put('/settings', async (c) => {
     { key: CONTACT_TELEGRAM_URL, value: body.contactTelegramUrl, updatedAt },
     { key: RENDER_LIMIT_DEFAULT, value: String(body.renderLimitDefault), updatedAt },
   ]
-  // Single multi-row upsert: 5 rows × 3 params = 15 bound params, well under the 100-cap
+  // Optional: omitted = the stored test stack switch stays as it is (no row is written), so a
+  // web build that does not send the field can never flip it.
+  if (body.testsiteEnabled !== undefined) {
+    rows.push({ key: TESTSITE_ENABLED, value: String(body.testsiteEnabled), updatedAt })
+  }
+  // Single multi-row upsert: up to 6 rows × 3 params = 18 bound params, well under the 100-cap
   // and 50-stmt-per-request limits. Keeping it atomic avoids half-persisted settings.
   await db
     .insert(siteSettings)
@@ -539,3 +548,7 @@ adminRoutes.put('/settings', async (c) => {
   const map = await getSiteSettings(db)
   return c.json(toAdminSettings(map))
 })
+
+// ---- landing page (public GET /landing): /admin/landing/*, registered after requireAdmin above
+
+adminRoutes.route('/landing', adminLandingRoutes)

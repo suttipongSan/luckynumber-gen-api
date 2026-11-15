@@ -204,7 +204,8 @@ export interface ContactsResponse {
 /**
  * Admin GET/PUT /admin/settings. Empty strings for contact id/url mean "hide this channel"
  * (GET /contacts returns null for a channel whose id or URL is empty). `renderLimitDefault` is an
- * integer 1..100000.
+ * integer 1..100000. `testsiteEnabled` is the on/off switch of the test stack (default true);
+ * PUT accepts it as an optional boolean and leaves the stored value alone when it is omitted.
  */
 export interface AdminSettings {
   contactLineId: string
@@ -212,10 +213,116 @@ export interface AdminSettings {
   contactTelegramId: string
   contactTelegramUrl: string
   renderLimitDefault: number
+  testsiteEnabled: boolean
 }
 
 export interface AdminNews extends News {
   active: boolean
+}
+
+/**
+ * A block of the public landing page: an 'article' is a full article (a card on the landing page
+ * that links to the article's own page), a 'howto' is a numbered step. Titles and bodies are PLAIN
+ * TEXT, never HTML; clients must render them as text. Only `contentHtml` of an article is HTML, and
+ * the API stores and returns it sanitized (src/lib/sanitizeHtml.ts).
+ */
+export type LandingKind = 'article' | 'howto'
+export const LANDING_KINDS = ['article', 'howto'] as const satisfies readonly LandingKind[]
+
+/**
+ * An article card in `GET /landing`: title = headline, body = the short summary, imageUrl = the
+ * cover picture, slug = the address of its page (`GET /landing/articles/:slug`). The long text is
+ * NOT in this list. `slug` / `publishedAt` are null only for a row that was edited by hand.
+ */
+export interface LandingArticle {
+  id: string
+  title: string
+  body: string
+  slug: string | null
+  imageUrl: string | null
+  /** ISO-8601 UTC timestamp, or null when the article has no date. */
+  publishedAt: string | null
+}
+
+/** A numbered how-to step in `GET /landing`. */
+export interface LandingStep {
+  id: string
+  title: string
+  body: string
+  imageUrl: string | null
+}
+
+/**
+ * Public `GET /landing/articles/:slug` (no auth, `Cache-Control: public, max-age=60`): one ACTIVE
+ * article with its long text. `contentHtml` is sanitized HTML (allowlist in sanitizeHtml.ts); when
+ * it is empty the page shows `body` as plain text instead.
+ */
+export interface LandingArticleDetail {
+  id: string
+  slug: string
+  title: string
+  body: string
+  contentHtml: string
+  imageUrl: string | null
+  publishedAt: string | null
+}
+
+/**
+ * Public GET /landing (no auth, `Cache-Control: public, max-age=60`). Lists active items only,
+ * ordered by sort_order. `logoUrl` / `promoUrl` / `imageUrl` are absolute URLs of
+ * GET /landing/image/:name on this API, or null when no image is set.
+ */
+export interface LandingResponse {
+  heroColor: string
+  heroTitle: string
+  heroSubtitle: string
+  logoUrl: string | null
+  promoUrl: string | null
+  articlesTitle: string
+  articlesSubtitle: string
+  howtoTitle: string
+  howtoSubtitle: string
+  articles: LandingArticle[]
+  steps: LandingStep[]
+}
+
+/** The editable single values of the landing page (back office GET/PUT /admin/landing). */
+export interface AdminLandingSettings {
+  heroColor: string
+  heroTitle: string
+  heroSubtitle: string
+  articlesTitle: string
+  articlesSubtitle: string
+  howtoTitle: string
+  howtoSubtitle: string
+  logoUrl: string | null
+  promoUrl: string | null
+}
+
+/**
+ * One landing block as the back office sees it (active or not, with its sort position). For a
+ * 'howto' step `slug` and `publishedAt` are null and `contentHtml` is ''.
+ */
+export interface AdminLandingItem {
+  id: string
+  kind: LandingKind
+  title: string
+  body: string
+  imageUrl: string | null
+  sortOrder: number
+  active: boolean
+  /** Address of the article page; null for a step. */
+  slug: string | null
+  /** Sanitized HTML of the long text of an article ('' = none). */
+  contentHtml: string
+  /** ISO-8601 UTC timestamp shown on the article, or null. */
+  publishedAt: string | null
+}
+
+/** `GET /admin/landing`: `items` are ALL items ordered by kind, then sortOrder. */
+export interface AdminLanding {
+  settings: AdminLandingSettings
+  items: AdminLandingItem[]
 }
 
 export interface ApiErrorBody {
@@ -255,6 +362,12 @@ export interface Bindings {
   ADMIN_PASSWORD_HASH: string
   WEB_URL: string
   COOKIE_SECURE?: string
+  /**
+   * 'true' only on the test Worker (numbergen-api-test). There, a `testsite_enabled` = "false"
+   * setting makes every request answer 503 TESTSITE_OFF (src/middleware/testStack.ts). Unset on
+   * the live Worker, where the middleware does nothing.
+   */
+  TEST_STACK?: string
   ASSETS: AssetBucket
   /**
    * Web Push (VAPID) keys, base64url: the 65 byte public point and the 32 byte private scalar
@@ -310,6 +423,17 @@ export const MAX_SETS = 40
 /** Max files per asset kind (background / logo / qr) per member. */
 export const MAX_ASSETS_PER_KIND = 2
 export const MAX_CUSTOM_LOTTERIES = 30
+/** Landing page blocks per kind ('article' / 'howto'); the 13th is a 409 QUOTA. */
+export const MAX_LANDING_ITEMS_PER_KIND = 12
+/** Article slug length (characters), see LANDING_SLUG_RE in src/lib/landing.ts. */
+export const LANDING_SLUG_MIN = 3
+export const LANDING_SLUG_MAX = 80
+/** Longest `contentHtml` the API reads from a request (characters, before sanitizing). */
+export const MAX_LANDING_CONTENT_INPUT = 60_000
+/** Longest `contentHtml` the API stores (characters, after sanitizing). */
+export const MAX_LANDING_CONTENT_HTML = 20_000
+/** Largest JSON body accepted by POST / PATCH /admin/landing/items (bytes). */
+export const MAX_LANDING_ITEM_BODY_BYTES = 512 * 1024
 /** Push devices (browsers) per member; registering another drops the oldest. */
 export const MAX_PUSH_DEVICES = 10
 /** Lines accepted by one PUT /notifications or PUT /admin/notifications. */

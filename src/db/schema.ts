@@ -243,3 +243,44 @@ export const pushSubscriptions = sqliteTable(
   },
   (t) => [index('push_subscriptions_member_idx').on(t.memberId)],
 )
+
+/**
+ * Content blocks of the public landing page, edited in the back office. `kind` 'article' is a
+ * full article (card on the landing page + its own public page), 'howto' is a numbered step.
+ * `title` / `body` are PLAIN TEXT, never HTML. `imageKey` is the R2 file name under `landing/`
+ * (null = no image): the cover picture of an article, the picture of a step. Ordered by
+ * `sortOrder` within a kind; the single-value texts and the two header images live in
+ * site_settings (see src/lib/landing.ts). Not linked to any other table.
+ *
+ * For kind 'article': title = headline, body = short summary shown on the card, imageKey = cover
+ * picture, `contentHtml` = the long text. A 'howto' row keeps slug NULL, contentHtml '' and
+ * publishedAt NULL.
+ */
+export const landingItems = sqliteTable(
+  'landing_items',
+  {
+    id: text('id').primaryKey(),
+    kind: text('kind', { enum: ['article', 'howto'] }).notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull(),
+    imageKey: text('image_key'),
+    sortOrder: integer('sort_order').notNull(),
+    active: integer('active', { mode: 'boolean' }).notNull().default(true),
+    createdAt: text('created_at').notNull(),
+    updatedAt: text('updated_at').notNull(),
+    /** Address of the article page (/articles/<slug>). Unique among the non-NULL values. */
+    slug: text('slug'),
+    /**
+     * The long text as HTML. ALWAYS the output of sanitizeHtml (src/lib/sanitizeHtml.ts): the API
+     * sanitizes on every write. '' = none, the article page then shows `body` as plain text.
+     */
+    contentHtml: text('content_html').notNull().default(''),
+    /** ISO-8601 UTC timestamp shown on the article (NULL = no date). */
+    publishedAt: text('published_at'),
+  },
+  (t) => [
+    index('landing_items_kind_sort_idx').on(t.kind, t.sortOrder),
+    // Two articles can never share an address; rows without a slug (steps) are not constrained.
+    uniqueIndex('landing_items_slug_unique_idx').on(t.slug).where(sql`slug IS NOT NULL`),
+  ],
+)

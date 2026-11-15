@@ -15,6 +15,7 @@
     "vapid:generate": "tsx scripts/vapid-generate.ts",
     "predeploy": "npm run db:migrate:remote",
     "deploy": "wrangler deploy",
+    "deploy:test": "wrangler deploy --env test",
     "db:migrate:remote": "wrangler d1 migrations apply numbergen --remote",
     "seed:remote": "tsx scripts/seed-sql.ts && wrangler d1 execute numbergen --remote --file seed.sql"
   },

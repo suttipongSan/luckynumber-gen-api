@@ -21,14 +21,20 @@ src/lib/numbers.ts      number generation: running digits, top, 2 ตัว / 3 
 src/lib/ids.ts          16-char base62 ids, 32-char tokens
 src/lib/loginLimiter.ts 5 wrong passwords → 429 for 15 min (login_attempts table)
 src/lib/siteSettings.ts site_settings key whitelist, compiled-in defaults, effective-limit helpers
+src/lib/landing.ts      public landing page: landing_* settings keys + defaults, R2 image names / URLs, image signature check, article slugs, loaders, row -> JSON
+src/lib/sanitizeHtml.ts allowlist HTML sanitizer for the long text of an article (tokenizer + element stack, no DOM, linear time)
 src/lib/webpush.ts      Web Push for Workers (WebCrypto only): VAPID JWT, RFC 8291 encryption, push-service allow-list, sender
 src/lib/reminders.ts    the per-minute cron: cursor, "who is due" query, notification text, sending, cleanup
 src/middleware/         memberAuth (session + expiry/disabled check on every call), adminAuth
-src/routes/             link, me, bootstrap, contacts, lotteries, news, sets, settings, render, assets, push, notifications, admin
+src/routes/             link, me, bootstrap, contacts, landing, lotteries, news, sets, settings, render, assets, push, notifications,
+                        admin (+ adminLanding, mounted at /admin/landing behind the same admin guard)
 drizzle/                generated SQL migrations
 scripts/                seed-sql (writes seed.sql for D1), hash-password, vapid-generate, db (test helpers)
 test/                   vitest: numbers, crypto/signed URLs, app (app.request + file:test.db + fake R2),
-                        notifications (reminder + push endpoints), reminders (cron logic), webpush (RFC 8291 / VAPID)
+                        notifications (reminder + push endpoints), reminders (cron logic), webpush (RFC 8291 / VAPID),
+                        landing (public landing page + its back office, own file:test-landing.db),
+                        articles (article pages: migration 0007, slug / long text / date rules, own file:test-articles.db),
+                        sanitizeHtml (the HTML sanitizer: adversarial tables, random inputs, linear-time checks)
 ```
 
 ## Setup
@@ -83,7 +89,7 @@ Live on the operator's Cloudflare account (all free plan):
 |---|---|
 | Worker | `numbergen-api` → https://api.pnphoto.co |
 | Database | D1 `numbergen` (binding `DB`, APAC) |
-| Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private) |
+| Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private; member assets are only served through signed URLs, and only the `landing/` prefix is public, through `GET /landing/image/:name`) |
 | Web origin | `WEB_URL` in wrangler.toml → https://pnphoto.co (comma-separated list; first one is used in member links) |
 
 Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`
@@ -91,6 +97,10 @@ Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASS
 For daily reminders also set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (`npm run vapid:generate` prints
 both and the commands); `VAPID_SUBJECT` (a `mailto:` or `https:` contact, default `https://pnphoto.co`) is optional.
 `wrangler.toml` has a cron trigger that runs every minute; it does nothing until both VAPID keys exist.
+`TEST_STACK` is a plain var (not a secret) that is the string `"true"` (quoted; a TOML boolean does not count) only
+on the separate test Worker `numbergen-api-test` (https://api-test.pnphoto.co: the same code deployed with
+`wrangler --env test`, same D1 database). Leave it unset everywhere else, including the live Worker; see
+"Test site switch" under Behaviour notes.
 
 ```powershell
 npm run db:migrate:remote   # after adding a migration
@@ -136,6 +146,18 @@ multi-row inserts.
   daily render limit. GET/PUT are at `/admin/settings`; public `GET /contacts` exposes just the
   two channel objects (null when the id is empty) with `Cache-Control: public, max-age=60`.
   Every key has a compiled-in default (`src/lib/siteSettings.ts`) so a fresh DB keeps working.
+  The landing page values also live in `site_settings`, but under their own `landing_*` keys that are NOT in this
+  whitelist, so these endpoints and the `AdminSettings` shape do not change (see "Landing page" below).
+- **Test site switch**: `site_settings` key `testsite_enabled` (`"true"` or `"false"`; no row = on). `GET` and
+  `PUT /admin/settings` carry it as `testsiteEnabled: boolean`. On PUT it is optional: leaving it out leaves the stored
+  value alone, so an older back office build that does not send it can never flip it. Only the exact text `"false"`
+  means off. `src/middleware/testStack.ts` (registered right after CORS in `src/index.ts`) enforces it, and only on the
+  test Worker, the one with the var `TEST_STACK = "true"`: while the switch is off, EVERY request to that Worker gets
+  `503 {"error":{"code":"TESTSITE_OFF","message":"เว็บทดสอบปิดอยู่"}}`, with the CORS headers so the browser can read
+  it (the OPTIONS preflight is still answered by CORS). The switch is cached in module memory for 15 seconds at most
+  (per Worker isolate), so a flip shows within about 15 s; if the database read fails the test stack counts as on, and
+  the failure is not remembered. Without `TEST_STACK` (live Worker, local dev, tests) the middleware does nothing and
+  reads nothing. The cron trigger is not an HTTP request and is not gated.
 
 ## Number generation (2 ตัว, 3 ตัว, เลขเด่น)
 
@@ -248,3 +270,145 @@ Sends run 6 at a time and at most 40 per run (a Worker invocation allows 50 subr
 its D1 calls; raise `MAX_SENDS_PER_RUN` on the paid plan); when the cap is hit the run logs what it dropped. A failing
 send never stops the others; devices answering 404 or 410 are deleted; `last_sent_day` is stamped on the existing
 member rows that fired (informational). Logs name the push service host, never the endpoint URL.
+
+## Landing page (2026-11-14)
+
+A public page for visitors who have no member session (pnphoto.co). Its content is edited in the back office and the
+web app only reads it. Code: `src/lib/landing.ts` (keys, defaults, image names and signatures, loaders, row -> JSON),
+`src/routes/landing.ts` (public) and `src/routes/adminLanding.ts` (back office, mounted by `admin.ts` under
+`/admin/landing` after the admin guard, so the session and CSRF rules are the same as for the rest of `/admin`).
+
+**Data** (migration `0006_add_landing_page`, additive only).
+
+- `landing_items(id, kind 'article' | 'howto', title, body, image_key, sort_order, active, created_at, updated_at)` with an
+  index on `(kind, sort_order)`. The migration seeds three articles and three how-to steps (`landing-article-1..3`,
+  `landing-howto-1..3`) so the page is not empty at launch. `title` and `body` are **plain text, never HTML**: they are
+  stored and returned as typed (after trimming), and clients must render them as text. Migration `0007_add_article_pages`
+  added `slug`, `content_html` and `published_at` (see "Articles as full pages" below).
+- The single values are `site_settings` rows under `landing_*` keys. They are kept in their own list
+  (`LANDING_SETTING_KEYS`), not in `SITE_SETTING_KEYS`, so `GET/PUT /admin/settings` and `AdminSettings` do not change.
+  Every key has a compiled-in default, so a database with none of these rows (fresh, or before an admin saved anything)
+  still serves a complete page. Only a missing row falls back to the default; a saved empty string stays empty.
+
+| Key (`PUT` field) | Default | Rule |
+|---|---|---|
+| `landing_hero_color` (`heroColor`) | `#7c2d12` | exactly `^#[0-9a-fA-F]{6}$`, stored as typed |
+| `landing_hero_title` (`heroTitle`) | `โปรแกรมทำใบใบ้หวย สวย ไว ในคลิกเดียว` | up to 120 characters, may be empty |
+| `landing_hero_subtitle` (`heroSubtitle`) | `สุ่มเลข จัดหน้าตา ดาวน์โหลดพร้อมโพสต์ ครบทุกหวยทุกรอบ` | up to 200, may be empty |
+| `landing_articles_title` (`articlesTitle`) | `ทำไมต้อง PNPHOTO` | up to 120, may be empty |
+| `landing_articles_subtitle` (`articlesSubtitle`) | empty | up to 200 |
+| `landing_howto_title` (`howtoTitle`) | `วิธีใช้งาน` | up to 120, may be empty |
+| `landing_howto_subtitle` (`howtoSubtitle`) | `เริ่มใช้ได้ใน 3 ขั้นตอน` | up to 200, may be empty |
+| `landing_logo_image`, `landing_promo_image` | empty | R2 file name; written only by the image endpoints |
+
+The texts are trimmed. A stored hero colour that is not `#RRGGBB` (only possible by editing the database by hand) is
+ignored in favour of the default, so the page never receives anything but a plain hex colour.
+
+**Public endpoints** (no auth, no cookies; CORS is the app-level allow-list, like `GET /contacts`):
+
+| Endpoint | Response |
+|---|---|
+| `GET /landing` | `200 {heroColor, heroTitle, heroSubtitle, logoUrl, promoUrl, articlesTitle, articlesSubtitle, howtoTitle, howtoSubtitle, articles: [{id, title, body, slug, imageUrl, publishedAt}], steps: [{id, title, body, imageUrl}]}` with `Cache-Control: public, max-age=60`. Active items only (an inactive item, and so its image, is never listed), ordered by `sort_order`. The `*Url` fields are absolute URLs (`<origin of the request>/landing/image/<file name>`) or `null`. An article card carries its cover picture, its `slug` (`string \| null`, the address of its page) and `publishedAt` (`string \| null`); the long text is NOT in this list |
+| `GET /landing/articles/:slug` | `200 {id, slug, title, body, contentHtml, imageUrl, publishedAt}` with `Cache-Control: public, max-age=60`, for an ACTIVE article with that slug. `404 NOT_FOUND` for an inactive article, a how-to step, an unknown slug and a slug that fails the slug rules (that one without a database lookup). `contentHtml` is sanitized HTML; when it is `""` the page shows `body` as plain text instead. The path has its own `/articles/` segment, so it cannot shadow or be shadowed by `/landing/image/:name` |
+| `GET /landing/image/:name` | the image bytes with their content type and `Cache-Control: public, max-age=31536000, immutable` (plus `X-Content-Type-Options: nosniff`). `:name` must match `^[A-Za-z0-9_-]{8,64}\.(png\|jpg\|jpeg\|webp)$`, otherwise 404 without touching R2; the lookup key is always `landing/` + the name. 404 when the object is missing |
+
+**Back office endpoints** (admin session; every one is `401 UNAUTHENTICATED` without it). Types: `AdminLandingSettings` is the
+seven text fields plus `logoUrl` / `promoUrl` (`string | null`); `AdminLandingItem` is
+`{id, kind, title, body, imageUrl, sortOrder, active, slug, contentHtml, publishedAt}` (`slug` and `publishedAt` are
+`string | null`, `contentHtml` a string; for a how-to step they are `null`, `""` and `null`); `AdminLanding` is
+`{settings, items}` where `items` are ALL items (active or not) ordered by kind, then `sortOrder`.
+
+| Endpoint | Body and response |
+|---|---|
+| `GET /admin/landing` | `AdminLanding` |
+| `PUT /admin/landing` | any subset of the seven text fields (unknown keys, including `logoUrl` / `promoUrl`, are ignored), all-or-nothing, answers `AdminLanding`. 400 for a bad colour or a too long text |
+| `POST /admin/landing/image/:slot` | `slot` is `logo` or `promo` (anything else 404); multipart `file` field; answers `AdminLanding` |
+| `DELETE /admin/landing/image/:slot` | clears the slot; answers `AdminLanding` |
+| `POST /admin/landing/items` | `{kind, title, body, active?, slug?, contentHtml?, publishedAt?}`: title 1..80, body 0..600 (required, may be `""`), `active` defaults to true; the item is appended at the end of its kind; answers `AdminLandingItem`. For an article: `slug` omitted / `null` / `""` = generated (`a-` + 8 hex characters), `contentHtml` is sanitized (default `""`), `publishedAt` omitted = now, `null` = no date. For a `howto`, sending `slug`, `contentHtml` or `publishedAt` at all is `400`. The 13th item of a kind is `409 QUOTA` (inactive items count); a slug another article has is `409 SLUG_TAKEN` |
+| `PATCH /admin/landing/items/:id` | `{title?, body?, active?, slug?, contentHtml?, publishedAt?}` (kind and position cannot be changed here); answers `AdminLandingItem`, 404 when missing. `slug` must be a valid slug (`null` / `""` are `400`: an article always keeps one), `contentHtml` is sanitized (`""` clears it), `publishedAt` is a date-time or `null`. On a `howto` the last three are `400`, whatever the value. A slug another article has is `409 SLUG_TAKEN` and nothing else of that PATCH is applied |
+| `DELETE /admin/landing/items/:id` | `204`; also deletes the item's image; 404 when missing |
+| `POST /admin/landing/items/:id/image` | multipart `file`; answers `AdminLandingItem` (the cover picture of an article, the picture of a step; both are shown on the public page) |
+| `DELETE /admin/landing/items/:id/image` | answers `AdminLandingItem` |
+| `PUT /admin/landing/items/order` | `{kind, ids}`: `ids` must be exactly the set of that kind's item ids (400 otherwise, also for duplicates); `sort_order` becomes the position (0, 1, 2 ...); answers the `AdminLandingItem[]` of that kind in the new order |
+
+**Images.** PNG, JPEG or WebP (declared `Content-Type`; SVG, GIF and AVIF are refused), 1 byte to 5 MB (`MAX_ASSET_BYTES`).
+The declared type is client-controlled, so the first bytes of the file must also be the file signature (magic bytes) of
+that type (PNG `89 50 4E 47 0D 0A 1A 0A`, JPEG `FF D8 FF`, WebP `RIFF` + 4 size bytes + `WEBP`; `hasImageSignature` in
+`src/lib/landing.ts`): text, HTML or another format labelled `image/png` is `400 VALIDATION` before R2 is touched. Files are
+stored in the `ASSETS` bucket as `landing/<16 random characters>.<png|jpg|webp>`. Unlike member assets they are public
+(no signed URL), which is safe because every upload gets a fresh random name: the bytes behind a name never change, hence
+`immutable`. Replacing or removing an image deletes the old object, best effort (a failing R2 delete is logged and never
+fails the request). The old name is read in the same D1 batch that writes the new one, so concurrent replacements cannot
+orphan a file, and a file whose database write failed is removed again.
+
+**Limits and concurrency.** At most 12 items per kind; the count, the next `sort_order` and the insert are one SQL statement
+(atomic under D1's single writer), so parallel creates cannot exceed it or share a position. The request body of
+`POST` / `PATCH /admin/landing/items` is capped at 512 KB.
+
+Run `npm run db:migrate` (local) or `npm run db:migrate:remote` / `npm run deploy` (production) to create the table and the
+six starter rows (and, with 0007, their addresses and dates).
+
+### Articles as full pages (migration `0007_add_article_pages`, 2026-11-15)
+
+An `article` row is a full article. On the landing page it is a card (cover picture, `title`, `body` as the short
+summary) that links to the article page (`GET /landing/articles/:slug`), which shows the formatted long text. A `howto`
+row is unchanged. Field meaning for an article: `title` = headline, `body` = summary on the card (plain text),
+`image_key` = cover picture, `content_html` = the long text. When `content_html` is empty the article page shows `body` as
+plain text instead.
+
+**Data** (additive only, `ALTER TABLE landing_items ADD ...`):
+
+| Column | Meaning |
+|---|---|
+| `slug TEXT NULL` | the address of the article page; `NULL` for a `howto`. A **partial unique index** `landing_items_slug_unique_idx ON (slug) WHERE slug IS NOT NULL` keeps two articles from sharing one |
+| `content_html TEXT NOT NULL DEFAULT ''` | the long text as sanitized HTML (`""` = none). Written only through `sanitizeHtml`, on every write |
+| `published_at TEXT NULL` | ISO-8601 UTC timestamp shown on the article |
+
+The migration also has a hand-written data step that works on a database where 0006 is already applied, whatever an admin
+did to the rows since: `landing-article-1..3` get the slugs `all-lotteries`, `customize-card` and `notify-time` (only where
+the row still exists, is still an article and has no slug, so an edited row keeps its new text and a deleted one is
+skipped); every other article gets `a-` + 8 random lower case hex characters (`lower(hex(randomblob(4)))`); every article
+without a date gets `published_at = created_at`. Steps are not touched. The migration was generated by `drizzle-kit`
+(`src/db/schema.ts`, `drizzle/meta/0007_snapshot.json` and `_journal.json` are in sync) and the data step added by hand.
+
+**Slugs.** `^[a-z0-9]+(?:-[a-z0-9]+)*$`, 3..80 characters (lower case letters and digits in groups joined by single
+hyphens). Anything else is `400 VALIDATION` (a slug is never lower-cased or trimmed for you). On create a missing / `null` /
+`""` slug is generated; a generated one that happens to clash is drawn again (up to 5 times). Uniqueness is decided by the
+unique index, not by a check before the write: when two requests race for one slug, the loser's `INSERT` / `UPDATE` fails
+with the constraint error and the route answers `409 SLUG_TAKEN` (Thai message). `GET /landing/articles/:slug` answers 404
+for a slug that fails the rules without querying the database.
+
+**`publishedAt`.** A strict ISO-8601 date or date-time: `2026-11-14`, `2026-11-14T10:30`, `2026-11-14T10:30:00.123Z`,
+`2026-11-14T17:30:00+07:00` (a space instead of `T` is accepted too). Real days and times only (no February 30, no
+`24:00`); free-form text such as `Nov 14` is refused even though `Date.parse` would take it. A value without a zone is
+read as UTC, so the result does not depend on the time zone of the server. It is stored and returned as a UTC
+`toISOString()` string.
+
+**`contentHtml` and the sanitizer** (`src/lib/sanitizeHtml.ts`). The API accepts any HTML text and stores only the
+sanitized result; the web app runs an allowlist sanitizer with the same rules again before it renders.
+
+- Allowed tags: `p br strong b em i u h2 h3 ul ol li blockquote a`. Output tag names are lower case and `<br>` is the void
+  form.
+- Allowed attribute: only `href` of an `<a>`, and only an absolute `http://`, `https://` or `mailto:` URL. It is judged the
+  way a browser reads it (character references decoded, tab / CR / LF ignored, control characters and spaces around it
+  stripped), so `jav&#x09;ascript:`, `&#106;avascript:` or a leading control character do not get through; any other value
+  (`javascript:`, `data:`, `vbscript:`, a relative URL, no value) unwraps the `<a>` and keeps its text. Every kept `<a>`
+  gets `rel="noopener noreferrer nofollow" target="_blank"` from the sanitizer, whatever the input said. All other
+  attributes (`style`, `class`, `id`, `on*` ...) are dropped.
+- Any other tag is removed and its text kept (`<div>`, `<span>`, `<h1>`, `<table>` ...), EXCEPT these, whose whole content
+  goes with them: `script style iframe object embed svg math template noscript title textarea select option form input
+  button link meta base head img video audio source picture canvas`. Comments, CDATA, doctype and processing instructions
+  are dropped.
+- The output is well formed (an unclosed tag is closed at the end, a stray end tag is dropped; a block closes an open `<p>`,
+  an `<li>` closes an `<li>`, a heading closes a heading, an `<a>` closes an `<a>`) and `& < > "` are
+  escaped in text and in the `href` (a no-break space stays one raw character, like in the web app's serializer, so the
+  length the editor counts is the length that is stored). NUL and other control characters are removed. Leading / trailing whitespace is trimmed,
+  so a text with nothing visible comes out as `""`.
+- It is idempotent (`sanitizeHtml(sanitizeHtml(x)) === sanitizeHtml(x)`) and linear in the input size: a small tokenizer
+  follows the HTML tokenization rules and the output is rebuilt from an allowlist. There is no regex over the document and
+  no DOM, HTMLRewriter or dependency, so it runs the same in the Workers runtime and in the Node tests. Because the output is
+  generated and not copied, a difference between this tokenizer and a browser can change which text survives, never let
+  markup through.
+- Limits: the raw `contentHtml` of a request is at most 60000 characters and the sanitized result at most 20000, otherwise
+  `400 VALIDATION` with a Thai message (entity escaping can make the result longer than the input, and an `<a>` gains its
+  `rel` / `target`).

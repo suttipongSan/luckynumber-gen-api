@@ -21,8 +21,11 @@ type BatchSqlite = BatchItem<'sqlite'>
 
 export const assetRoutes = new Hono<AppEnv>()
 
-/** Raster image types accepted for upload (SVG is refused: it could carry script). */
-const EXT_BY_TYPE: Record<string, string> = {
+/**
+ * Raster image types accepted for upload (SVG is refused: it could carry script). Exported so the
+ * landing page uploads (./adminLanding) share the content type -> extension table.
+ */
+export const EXT_BY_TYPE: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
   'image/webp': 'webp',

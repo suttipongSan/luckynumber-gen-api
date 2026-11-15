@@ -36,3 +36,40 @@ enabled = true
 # due. It does nothing until VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are set.
 [triggers]
 crons = ["* * * * *"]
+
+# ---------------------------------------------------------------------------------------------
+# TEST STACK (`npm run deploy:test`): a second Worker on api-test.pnphoto.co (web: pnphoto.co/testsite) for trying new code
+# before it goes live. It uses the SAME D1 database and R2 bucket as production, so everything
+# done there is real data, and migrations must already be applied (`npm run db:migrate:remote`).
+# Bindings and vars are not inherited by an environment, so they are repeated here.
+# Secrets are per Worker: set each one again with `wrangler secret put <NAME> --env test`.
+[env.test]
+name = "numbergen-api-test"
+routes = [{ pattern = "api-test.pnphoto.co", custom_domain = true }]
+workers_dev = false
+
+[env.test.vars]
+# The test site is served at https://pnphoto.co/testsite. The first entry is used for member
+# links; the second is the browser origin that CORS and the CSRF guard must allow.
+WEB_URL = "https://pnphoto.co/testsite,https://pnphoto.co"
+# Marks this Worker as the test stack: the admin switch "เว็บทดสอบ" (site_settings testsite_enabled)
+# can turn it off (src/middleware/testStack.ts). Must be the quoted string "true". Never set on production.
+TEST_STACK = "true"
+COOKIE_SECURE = "true"
+
+[[env.test.d1_databases]]
+binding = "DB"
+database_name = "numbergen"
+database_id = "7bbe7862-5da9-414d-89bb-ef8aba43721a"
+migrations_dir = "drizzle"
+
+[[env.test.r2_buckets]]
+binding = "ASSETS"
+bucket_name = "numbergen-assets"
+
+[env.test.observability]
+enabled = true
+
+# No reminder schedule on the test Worker: only production sends the daily push messages.
+[env.test.triggers]
+crons = []

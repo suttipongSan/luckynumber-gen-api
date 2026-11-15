@@ -4,10 +4,12 @@ import { cors } from 'hono/cors'
 import type { AppEnv, Bindings } from './types'
 import { API_VERSION } from './types'
 import { ApiError, errorJson, errors } from './lib/http'
+import { testStackGate } from './middleware/testStack'
 import { linkRoutes } from './routes/link'
 import { meRoutes } from './routes/me'
 import { bootstrapRoutes } from './routes/bootstrap'
 import { contactsRoutes } from './routes/contacts'
+import { landingRoutes } from './routes/landing'
 import { lotteryRoutes } from './routes/lotteries'
 import { newsRoutes } from './routes/news'
 import { setRoutes } from './routes/sets'
@@ -54,6 +56,10 @@ app.use('*', async (c, next) => {
   })(c, next)
 })
 
+// Test stack kill switch: only when TEST_STACK=true (test Worker) and the back office switch is off,
+// every request gets 503 TESTSITE_OFF. Right after CORS so the error carries the CORS headers.
+app.use('*', testStackGate)
+
 // CSRF guard: state-changing requests that carry an Origin must come from an allowed origin.
 // (multipart uploads are "simple" requests and would otherwise skip the CORS preflight.)
 app.use('*', async (c, next) => {
@@ -73,6 +79,7 @@ app.route('/', linkRoutes)
 app.route('/', meRoutes)
 app.route('/', bootstrapRoutes)
 app.route('/', contactsRoutes)
+app.route('/', landingRoutes)
 app.route('/', lotteryRoutes)
 app.route('/', newsRoutes)
 app.route('/', setRoutes)

@@ -2891,6 +2891,7 @@ describe('contacts + admin /admin/settings', () => {
       contactTelegramId: '@numbergen_support',
       contactTelegramUrl: 'https://t.me/numbergen_support',
       renderLimitDefault: 600,
+      testsiteEnabled: true,
     })
   })
 
@@ -2910,6 +2911,7 @@ describe('contacts + admin /admin/settings', () => {
       contactTelegramId: '@pnphoto_bot',
       contactTelegramUrl: 'https://t.me/pnphoto_bot',
       renderLimitDefault: 1200,
+      testsiteEnabled: true,
     })
     const get = await (await call('GET', '/admin/settings', admin)).json()
     expect(get).toMatchObject({ renderLimitDefault: 1200, contactLineId: '@pnphoto' })

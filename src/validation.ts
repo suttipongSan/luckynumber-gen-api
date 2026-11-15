@@ -2,7 +2,21 @@
 // bounds from API.md are enforced (rows 0..6, perRow 1..6, fontSize 8..400, colours ≤ 40 chars,
 // whole document ≤ 32 KB).
 import { z } from 'zod'
-import { GROUPS, MAX_NOTIFICATION_ITEMS, MAX_ROUND, MIN_ROUND } from './types'
+import {
+  GROUPS,
+  LANDING_KINDS,
+  LANDING_SLUG_MAX,
+  LANDING_SLUG_MIN,
+  MAX_LANDING_CONTENT_HTML,
+  MAX_LANDING_CONTENT_INPUT,
+  MAX_LANDING_ITEMS_PER_KIND,
+  MAX_NOTIFICATION_ITEMS,
+  MAX_ROUND,
+  MIN_ROUND,
+} from './types'
+import { LANDING_COLOR_RE, isLandingSlug } from './lib/landing'
+import { sanitizeHtml } from './lib/sanitizeHtml'
+import { parseIsoDateTime } from './lib/time'
 import { decodeAuthSecret, decodeP256dh, MAX_ENDPOINT_LENGTH, parsePushEndpoint } from './lib/webpush'
 
 export const MAX_SETTINGS_BYTES = 32 * 1024
@@ -212,6 +226,7 @@ export const patchMemberSchema = z.object({
 //   /contacts endpoint (web then drops the button).
 // - Contact URLs: either empty OR https://… (max 500 chars). Empty keeps the channel hidden.
 // - renderLimitDefault: integer 1..100000.
+// - testsiteEnabled: optional boolean (a real boolean, not "true"/1); omitted = leave unchanged.
 const contactId = z.string().trim().max(60)
 const contactUrl = z
   .string()
@@ -225,6 +240,7 @@ export const adminSettingsSchema = z.object({
   contactTelegramId: contactId,
   contactTelegramUrl: contactUrl,
   renderLimitDefault: z.number().int().min(1).max(100_000),
+  testsiteEnabled: z.boolean().optional(),
 })
 
 // Daily reminder time of a lottery: "HH:MM" (00:00..23:59, zero padded), Asia/Bangkok.
@@ -262,6 +278,104 @@ export const newsSchema = z.object({
   active: z.boolean(),
 })
 export const patchNewsSchema = newsSchema.partial()
+
+// Landing page, back office PUT /admin/landing: any subset of the seven text values (unknown keys
+// such as logoUrl are dropped; images only change through the image endpoints).
+// - heroColor: exactly #RRGGBB.
+// - Headings up to 120 and subtitles up to 200 characters, trimmed plain text. An empty string is
+//   allowed (the public page then shows no heading / subtitle there).
+const landingHeading = z.string().trim().max(120, 'ยาวได้ไม่เกิน 120 ตัวอักษร')
+const landingSubheading = z.string().trim().max(200, 'ยาวได้ไม่เกิน 200 ตัวอักษร')
+const landingKind = z.enum(LANDING_KINDS, "ต้องเป็น 'article' หรือ 'howto'")
+
+export const adminLandingSchema = z
+  .object({
+    heroColor: z.string().regex(LANDING_COLOR_RE, 'สีต้องอยู่ในรูปแบบ #RRGGBB เช่น #7c2d12'),
+    heroTitle: landingHeading,
+    heroSubtitle: landingSubheading,
+    articlesTitle: landingHeading,
+    articlesSubtitle: landingSubheading,
+    howtoTitle: landingHeading,
+    howtoSubtitle: landingSubheading,
+  })
+  .partial()
+
+// Landing blocks: title 1..80, body 0..600, both PLAIN TEXT (stored and returned exactly as typed
+// after trimming; clients render them as text, never as HTML). `active` defaults to true on create.
+const landingTitle = z.string().trim().min(1, 'ต้องระบุหัวข้อ').max(80, 'หัวข้อยาวได้ไม่เกิน 80 ตัวอักษร')
+const landingBody = z.string().trim().max(600, 'รายละเอียดยาวได้ไม่เกิน 600 ตัวอักษร')
+
+// The article fields (kind 'article' only; a 'howto' step has none of them).
+// - slug: the address of the article page, see isLandingSlug. On create it may also be '' or null
+//   (the API then makes one up); on PATCH an article always keeps a slug, so those two are refused.
+// - contentHtml: the long text. Up to 60000 characters are read, the sanitized result (allowlist in
+//   lib/sanitizeHtml) must fit in 20000 and is what the route stores. Clients may send any HTML.
+// - publishedAt: an ISO-8601 date or date-time (parseIsoDateTime), stored as a UTC ISO string.
+const SLUG_MESSAGE = `ใช้ได้เฉพาะตัวอักษรอังกฤษพิมพ์เล็ก ตัวเลข และ - คั่นระหว่างคำ (ไม่ขึ้นต้นหรือลงท้ายด้วย -) ยาว ${LANDING_SLUG_MIN}-${LANDING_SLUG_MAX} ตัวอักษร`
+const landingSlug = z.string({ error: SLUG_MESSAGE }).refine(isLandingSlug, SLUG_MESSAGE)
+const landingSlugOrAuto = z
+  .string({ error: SLUG_MESSAGE })
+  .refine((v) => v === '' || isLandingSlug(v), SLUG_MESSAGE)
+  .nullable()
+const landingContentHtml = z
+  .string({ error: 'เนื้อหาต้องเป็นข้อความ' })
+  .max(MAX_LANDING_CONTENT_INPUT, `เนื้อหายาวเกินไป (รับได้ไม่เกิน ${MAX_LANDING_CONTENT_INPUT} ตัวอักษร)`)
+  .transform(sanitizeHtml)
+  .refine(
+    (v) => v.length <= MAX_LANDING_CONTENT_HTML,
+    `เนื้อหายาวเกินไป (หลังตัดส่วนที่ไม่รองรับออกแล้วต้องไม่เกิน ${MAX_LANDING_CONTENT_HTML} ตัวอักษร)`,
+  )
+const PUBLISHED_AT_MESSAGE = 'วันที่เผยแพร่ต้องเป็นรูปแบบ ISO 8601 เช่น 2026-11-14T10:00:00Z'
+const landingPublishedAt = z
+  .string({ error: PUBLISHED_AT_MESSAGE })
+  .refine((v) => parseIsoDateTime(v) !== null, PUBLISHED_AT_MESSAGE)
+  .transform((v) => parseIsoDateTime(v) as string)
+  .nullable()
+
+export const HOWTO_ARTICLE_FIELDS_MESSAGE =
+  'ขั้นตอนวิธีใช้ (howto) ไม่มี slug เนื้อหาบทความ หรือวันที่เผยแพร่'
+/** The three article-only fields: a 'howto' step must not receive any of them (even null / ''). */
+export const LANDING_ARTICLE_ONLY_FIELDS = ['slug', 'contentHtml', 'publishedAt'] as const
+
+export const landingItemSchema = z
+  .object({
+    kind: landingKind,
+    title: landingTitle,
+    body: landingBody,
+    active: z.boolean().optional(),
+    slug: landingSlugOrAuto.optional(),
+    contentHtml: landingContentHtml.optional(),
+    publishedAt: landingPublishedAt.optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.kind !== 'howto') return
+    for (const field of LANDING_ARTICLE_ONLY_FIELDS) {
+      if (val[field] !== undefined) {
+        ctx.addIssue({ code: 'custom', path: [field], message: HOWTO_ARTICLE_FIELDS_MESSAGE })
+      }
+    }
+  })
+// PATCH: any subset of title / body / active / slug / contentHtml / publishedAt. `kind` and the
+// position cannot be changed here (reordering has its own endpoint), so such keys in the body are
+// ignored. Whether the item is an article (the only kind that may receive the last three) depends
+// on the row, so the route checks that.
+export const patchLandingItemSchema = z.object({
+  title: landingTitle.optional(),
+  body: landingBody.optional(),
+  active: z.boolean().optional(),
+  slug: landingSlug.optional(),
+  contentHtml: landingContentHtml.optional(),
+  publishedAt: landingPublishedAt.optional(),
+})
+
+// PUT /admin/landing/items/order: the new order of one kind. Whether the ids are exactly the
+// kind's current items is checked against the database by the route.
+export const landingOrderSchema = z.object({
+  kind: landingKind,
+  ids: z
+    .array(z.string().min(1).max(64))
+    .max(MAX_LANDING_ITEMS_PER_KIND, `เรียงลำดับได้ไม่เกิน ${MAX_LANDING_ITEMS_PER_KIND} รายการ`),
+})
 
 // PUT /notifications (member) and PUT /admin/notifications (admin catalog defaults): the same
 // body. A line that is on needs a time. The ids must be unique; whether the lotteries exist and

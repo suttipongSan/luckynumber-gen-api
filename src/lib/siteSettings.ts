@@ -17,6 +17,8 @@ export const CONTACT_LINE_URL = 'contact_line_url'
 export const CONTACT_TELEGRAM_ID = 'contact_telegram_id'
 export const CONTACT_TELEGRAM_URL = 'contact_telegram_url'
 export const RENDER_LIMIT_DEFAULT = 'render_limit_default'
+/** On/off switch of the test stack ("true" | "false"), see src/middleware/testStack.ts. */
+export const TESTSITE_ENABLED = 'testsite_enabled'
 
 /** Whitelist of settings keys accepted by GET/PUT /admin/settings. */
 export const SITE_SETTING_KEYS = [
@@ -25,6 +27,7 @@ export const SITE_SETTING_KEYS = [
   CONTACT_TELEGRAM_ID,
   CONTACT_TELEGRAM_URL,
   RENDER_LIMIT_DEFAULT,
+  TESTSITE_ENABLED,
 ] as const
 export type SiteSettingKey = (typeof SITE_SETTING_KEYS)[number]
 
@@ -39,6 +42,7 @@ export const DEFAULTS: Readonly<Record<SiteSettingKey, string>> = {
   [CONTACT_TELEGRAM_ID]: '@numbergen_support',
   [CONTACT_TELEGRAM_URL]: 'https://t.me/numbergen_support',
   [RENDER_LIMIT_DEFAULT]: String(RENDERS_PER_DAY),
+  [TESTSITE_ENABLED]: 'true',
 }
 
 export type SiteSettingsMap = Record<SiteSettingKey, string>
@@ -66,6 +70,14 @@ export function parseDefaultRenderLimit(value: string | undefined | null): numbe
   if (!value) return RENDERS_PER_DAY
   const n = Number.parseInt(value, 10)
   return Number.isFinite(n) && n >= 1 && n <= 100_000 ? n : RENDERS_PER_DAY
+}
+
+/**
+ * Parses the test stack switch. Only the exact text "false" means OFF; a missing row (default
+ * "true") or any other text counts as ON, so a garbled row cannot switch the test site off.
+ */
+export function parseTestsiteEnabled(value: string | undefined | null): boolean {
+  return value !== 'false'
 }
 
 /**
