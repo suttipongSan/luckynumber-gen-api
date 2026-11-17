@@ -6,6 +6,7 @@
 //  - two (2 ตัว): `row` rows of exactly `perRow` unique 2-digit numbers, no number twice in the block
 //      1 row:    every number starts with r1 or r2
 //      2+ rows:  row 1 starts with r1, row 2 starts with r2, rows 3+ are any 2-digit number (00-99)
+//    and none of the rows (top-ups included) holds a 2-digit เลขเด่น or its reverse (see single)
 //  - three (3 ตัว): same shape with 3-digit numbers and "contains" instead of "starts with"
 //      1 row:    every number contains r1 or r2 (any position)
 //      2+ rows:  row 1 contains r1, row 2 contains r2, rows 3+ are any 3-digit number (000-999)
@@ -14,7 +15,11 @@
 //    unique, so at most 9 (the prefix followed by each other digit)
 //  - win: rows of `digitCount` distinct digits that must include the running (or top) digits
 //  - single (เลขเด่น): one 1/2/3-digit number unless fixedSingle locks it — 1 digit: a running
-//    digit; 2 digits: r1 followed by r2; 3 digits: a number containing a running digit
+//    digit; 2 digits: r1 followed by r2; 3 digits: a number containing a running digit.
+//    A 2-digit one needs no random draw, so it is settled before the 2 ตัว block, which then leaves
+//    it and its reverse out (รูด 4 - 1, เลขเด่น 41: no 41 and no 14; 77 is its own reverse, so only
+//    77). The block cannot know whether the card shows เลขเด่น, so this holds either way. A 1 or
+//    3 digit one changes nothing: the 2 ตัว block is drawn as if there were no เลขเด่น.
 // The only shape change: two/three are returned as one inner array per row (API.md CardNumbers).
 // runningDouble (draw each running digit twice) is display only and is not read here.
 import type { CardNumbers, CardSettings, DrillPrefixFrom, WinInclude } from '../types'
@@ -119,16 +124,19 @@ function sampleDistinct(pool: number[], k: number): number[] {
  * `rules.second` and rows 3 and beyond take any number. Every row is a uniform random sample,
  * without replacement, of the numbers its rule allows that no earlier row took, so no number
  * appears twice in the block. Numbers made of one repeated digit (00..99 / 000..999) are left out
- * of every row unless `allowRepeat`.
+ * of every row unless `allowRepeat`. Numbers in `exclude` (by value, "07" is 7) are left out of
+ * every row and of the top-up too, so each row stays a uniform sample of what its rule allows
+ * minus those.
  *
  * Layout: every row holds exactly `perRow` numbers, because the web draws a row per inner array.
  * If a rule row's pool is smaller than `perRow` the row keeps its whole pool and the missing slots
  * are topped up with unused numbers of any kind (after every rule row has taken its own pool
  * first, so a top-up never takes a number a later rule row needs). The smallest rule pool is 9
- * numbers ("starts with r1" with doubles off; 10 with them on) and the API only accepts
- * perRow 1..6, so this only happens for direct callers with perRow above 9 / 10. A block asked
- * for more numbers than exist (above 90 / 100 two-digit, 990 / 1000 three-digit) ends up short;
- * empty trailing rows are dropped.
+ * numbers ("starts with r1" with doubles off; 10 with them on), or 8 (9) once the 2 ตัว exclusion
+ * takes one of them out, and the API only accepts perRow 1..6, so this only happens for direct
+ * callers with perRow above 8 / 9. A block asked for more numbers than exist (above 90 / 100
+ * two-digit, 990 / 1000 three-digit, less the excluded ones) ends up short; empty trailing rows
+ * are dropped.
  */
 function genBlock(
   len: 2 | 3,
@@ -136,6 +144,7 @@ function genBlock(
   perRow: number,
   allowRepeat: boolean,
   rules: BlockRules,
+  exclude: readonly number[] = [],
 ): string[][] {
   const profile = PROFILE[len]
   const size = profile.length
@@ -143,8 +152,10 @@ function genBlock(
   const rowCount = Number.isFinite(rows) ? Math.min(Math.max(0, Math.trunc(rows)), Math.ceil(size / per)) : 0
   // 00 11 .. 99 are the multiples of 11, 000 111 .. 999 the multiples of 111.
   const repeated = (size - 1) / 9
+  // 1 = no row may take it: the excluded numbers from the start, then each number a row takes.
   const used = new Uint8Array(size)
-  /** Every number passing `mask` that no row has taken (nor a repeated-digit one unless allowed). */
+  for (const n of exclude) if (Number.isInteger(n) && n >= 0 && n < size) used[n] = 1
+  /** Every number passing `mask` that is still free (and a repeated-digit one only if allowed). */
   const pool = (mask: number): number[] => {
     const out: number[] = []
     for (let n = 0; n < size; n++) {
@@ -180,20 +191,21 @@ function genBlock(
 
 /**
  * The 2 ตัว block: `rows` x `perRow` unique 2-digit numbers (rows 1 / 2 start with r1 / r2, or
- * with either when there is a single row; later rows are any number). See genBlock.
+ * with either when there is a single row; later rows are any number). `exclude` lists 2-digit
+ * numbers ("41", "14") that appear nowhere in the block, top-ups included; the card passes its
+ * 2-digit เลขเด่น and the reverse of it (twoExclusions). Anything that is not 2 digits is ignored.
+ * See genBlock.
  */
 export function genTwo(
   rows: number,
   perRow: number,
   running: [Digit, Digit],
-  opts?: { isDouble?: boolean },
+  opts?: { isDouble?: boolean; exclude?: readonly string[] },
 ): string[][] {
   const [r1, r2] = running
-  return genBlock(2, rows, perRow, opts?.isDouble ?? false, {
-    only: (1 << r1) | (1 << r2),
-    first: 1 << r1,
-    second: 1 << r2,
-  })
+  const exclude = (opts?.exclude ?? []).filter((s) => /^\d{2}$/.test(s)).map(Number)
+  const rules = { only: (1 << r1) | (1 << r2), first: 1 << r1, second: 1 << r2 }
+  return genBlock(2, rows, perRow, opts?.isDouble ?? false, rules, exclude)
 }
 
 /**
@@ -272,6 +284,18 @@ export function genSingle(digits: number, running: [Digit, Digit], opts?: { allo
   return `${running[0]}${running[1]}`
 }
 
+/**
+ * The 2 ตัว numbers a เลขเด่น rules out: when it has 2 digits, itself and its reverse ("41" and
+ * "14"; a number that is its own reverse, like "77", gives just itself). Nothing for anything else
+ * (1 or 3 digits, no value), so those leave the 2 ตัว block untouched.
+ */
+export function twoExclusions(single: string | undefined): string[] {
+  const s = parseFixedSingle(single, 2)
+  if (s === undefined) return []
+  const reversed = s[1] + s[0]
+  return reversed === s ? [s] : [s, reversed]
+}
+
 function clampInt(v: unknown, min: number, max: number, fallback: number): number {
   if (typeof v !== 'number' || !Number.isFinite(v)) return fallback
   return Math.max(min, Math.min(max, Math.trunc(v)))
@@ -280,7 +304,18 @@ function clampInt(v: unknown, min: number, max: number, fallback: number): numbe
 export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
   const running = pickRunning(cfg.fixed)
 
-  const two = genTwo(cfg.two?.row ?? 0, cfg.two?.perRow ?? 1, running, { isDouble: cfg.two?.isDouble })
+  // A เลขเด่น that needs no random draw is settled first: a valid fixedSingle, else r1 followed by
+  // r2 for 2 digits. A 2-digit one is kept out of the 2 ตัว block together with its reverse, and
+  // this same value is returned as `single` (it is never drawn a second time).
+  const singleDigits = clampInt(cfg.single?.digits, 1, 3, 2)
+  const settled =
+    parseFixedSingle(cfg.single?.fixed, singleDigits) ??
+    (singleDigits === 2 ? genSingle(2, running) : undefined)
+
+  const two = genTwo(cfg.two?.row ?? 0, cfg.two?.perRow ?? 1, running, {
+    isDouble: cfg.two?.isDouble,
+    exclude: twoExclusions(settled),
+  })
   const three = genThree(cfg.three?.row ?? 0, cfg.three?.perRow ?? 1, running, {
     allowTriple: cfg.three?.allowTriple,
   })
@@ -309,12 +344,10 @@ export function generateCardNumbers(cfg: GenerateInput): CardNumbers {
         : [running[0], running[1]]
   const win = winRows > 0 ? genWin(winRows, cfg.win?.digitCount ?? 6, mustInclude) : []
 
-  // Drawn last, with its own random calls, so every number above keeps exactly the distribution
-  // it had before เลขเด่น existed.
-  const singleDigits = clampInt(cfg.single?.digits, 1, 3, 2)
-  const single =
-    parseFixedSingle(cfg.single?.fixed, singleDigits) ??
-    genSingle(singleDigits, running, { allowTriple: cfg.single?.allowTriple })
+  // A 1 or 3 digit เลขเด่น that is not fixed is drawn last, with its own random calls, so every
+  // number above keeps exactly the distribution it had before เลขเด่น existed. A 2-digit one takes
+  // no random draw; it only narrows the 2 ตัว block above (3 ตัว, top and win are untouched).
+  const single = settled ?? genSingle(singleDigits, running, { allowTriple: cfg.single?.allowTriple })
 
   return {
     running: [String(running[0]), String(running[1])],

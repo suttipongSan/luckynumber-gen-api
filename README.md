@@ -171,24 +171,36 @@ per-lottery switch.
 | 2 ตัว (`two`, 2-digit numbers) | every number starts with r1 or r2 | row 1 starts with r1, row 2 starts with r2, rows 3 and beyond are any 2-digit number (00-99) |
 | 3 ตัว (`three`, 3-digit numbers) | every number contains r1 or r2 (any position) | row 1 contains r1, row 2 contains r2 (any position), rows 3 and beyond are any 3-digit number (000-999) |
 
-With r1 = 8, r2 = 1, three rows of three, 2 ตัว could be `82 85 80 / 14 17 18 / 87 29 60`.
+With r1 = 8, r2 = 1, the default เลขเด่น `81` and three rows of three, 2 ตัว could be
+`82 85 80 / 14 17 19 / 87 29 60` (never 81 or 18, see "เลขเด่น and 2 ตัว" below).
 
 - `isDouble` off keeps 00, 11 .. 99 out of every 2 ตัว row and `allowTriple` off keeps 000, 111 .. 999 out of
   every 3 ตัว row, the random rows included.
 - No number appears twice in one block (across all its rows).
 - Each row is a uniform random sample, without replacement, of the numbers its rule allows that the earlier
-  rows have not taken. The random rows sample everything that is left.
+  rows have not taken, less the numbers the เลขเด่น rule below keeps out of 2 ตัว. The random rows sample
+  everything that is left.
 - `two` and `three` come back as one inner array per row, and every row holds exactly `perRow` numbers, so the
   rows of the card never shift (`top`, `drill` and `win` stay flat lists). `row` is validated to 0..6 and `perRow`
   to 1..6, and the smallest pool of a rule row is 9 numbers (row 1 or 2 of 2 ตัว with `isDouble` off, 10 with it
-  on), so every allowed `perRow` fits and nothing is ever padded. If a direct caller of `generateCardNumbers` asks
-  for a `perRow` above a rule row's pool (above 9, or 10 with `isDouble`), the row keeps its whole pool and the
-  missing slots are topped up with unused numbers of any kind (the switches and the no-repeat rule still apply).
-  A block that asks for more numbers than exist (above 90 / 100 two-digit, 990 / 1000 three-digit) comes back short.
+  on; 8 and 9 when the เลขเด่น rule takes one of them out), so every allowed `perRow` fits and nothing is ever
+  padded. If a direct caller of `generateCardNumbers` asks for a `perRow` above a rule row's pool (9 numbers, 10
+  with `isDouble`, one fewer when the เลขเด่น rule takes one out), the row keeps its whole pool and the missing slots
+  are topped up with unused numbers of any kind (the switches, the no-repeat rule and the เลขเด่น rule still apply).
+  A block that asks for more numbers than exist (above 90 / 100 two-digit, 990 / 1000 three-digit, less the numbers
+  the เลขเด่น rule keeps out) comes back short.
 - เลขเด่น (`single`): 2 digits (the default) is r1 followed by r2, so r1 = 8 and r2 = 1 give `81` (never a double,
   `isDouble` does not matter); 1 digit is one of the running digits at random; 3 digits is a random 3-digit number
   containing r1 or r2 (a triple only with `allowTriple`). A valid `fixedSingle` (digits only, exactly `singleDigits`
   long) always wins.
+- เลขเด่น and 2 ตัว: when the เลขเด่น has 2 digits (a valid 2-digit `fixedSingle`, else r1 followed by r2), the 2 ตัว
+  block never contains that number or its reverse, in any row (rows 3 and beyond and any top-up included). With
+  รูด 4 - 1 and เลขเด่น 41, neither 41 nor 14 appears in 2 ตัว; a fixed `93` keeps out 93 and 39, whatever the running
+  digits are. A number that is its own reverse, such as a fixed `77`, keeps out only itself (a repeated-digit number
+  is out already while `isDouble` is off). The เลขเด่น is settled before 2 ตัว is drawn and exactly that value comes
+  back as `single`; every other allowed number stays equally likely. The API cannot tell whether the card shows the
+  เลขเด่น element (`elements.single.visible` is not read), so the rule holds for a hidden เลขเด่น too. With a 1 or 3
+  digit เลขเด่น nothing changes: 2 ตัว is drawn as before (r1 r2 and r2 r1 may appear), and 3 ตัว is never affected.
 - `top` (cycles r1, r2), `drill` (one prefix digit from `drillPrefixFrom`, at most 9 numbers) and `win` (distinct
   digits that include the running or top digits) are unchanged. With `drillPrefixFrom: "two"` the prefix is the first
   digit of the first 2 ตัว number, which is now r1 (r1 or r2 when 2 ตัว has a single row).

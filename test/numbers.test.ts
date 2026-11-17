@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   generateCardNumbers,
   generateForSettings,
@@ -8,7 +8,9 @@ import {
   genWin,
   parseFixedDigit,
   pickRunning,
+  twoExclusions,
 } from '../src/lib/numbers'
+import type { CardSettings } from '../src/types'
 
 const RUNS = 200
 
@@ -159,8 +161,9 @@ const isRepeated = (s: string) => new Set(s).size === 1
 /**
  * What is wrong with a 2 ตัว block, [] when nothing: the row layout (`rows` rows of exactly
  * `perRow`), rule A (one row: every number starts with r1 or r2; 2+ rows: row 1 starts with r1,
- * row 2 with r2, later rows free), rule C (no 00..99 without isDouble, in any row) and rule D (no
- * number twice in the block).
+ * row 2 with r2, later rows free), rule C (no 00..99 without isDouble, in any row), rule D (no
+ * number twice in the block) and rule E (none of the `excluded` numbers anywhere: the 2-digit
+ * เลขเด่น and its reverse).
  */
 function twoViolations(
   two: string[][],
@@ -168,6 +171,7 @@ function twoViolations(
   rows: number,
   perRow: number,
   isDouble: boolean,
+  excluded: string[] = [],
 ): string[] {
   const bad: string[] = []
   if (two.length !== rows) bad.push(`${two.length} rows, want ${rows}`)
@@ -179,6 +183,7 @@ function twoViolations(
         bad.push(`${at}: ${t} is not 2 digits`)
         continue
       }
+      if (excluded.includes(t)) bad.push(`${at}: ${t} is excluded`)
       if (!isDouble && t[0] === t[1]) bad.push(`${at}: ${t} is a double`)
       if (rows === 1) {
         if (t[0] !== r1 && t[0] !== r2) bad.push(`${at}: ${t} starts with neither ${r1} nor ${r2}`)
@@ -238,6 +243,13 @@ describe('2 ตัว / 3 ตัว row rules', () => {
     expect(twoViolations([['80'], ['10'], ['11']], run, 3, 1, true)).toEqual([]) // ...unless isDouble
     expect(twoViolations([['80'], ['10'], ['80']], run, 3, 1, false).length).toBeGreaterThan(0) // repeats
     expect(twoViolations([['80', '81'], ['10']], run, 2, 2, false)).toHaveLength(1) // row 2 is short
+    // rule E: an excluded number is flagged in any row, rows 3+ included
+    const out = ['81', '18']
+    expect(twoViolations([['82', '85']], run, 1, 2, false, out)).toEqual([])
+    expect(twoViolations([['82', '81']], run, 1, 2, false, out)).toHaveLength(1)
+    expect(twoViolations([['80'], ['18']], run, 2, 1, false, out)).toHaveLength(1)
+    expect(twoViolations([['80'], ['10'], ['18']], run, 3, 1, false, out)).toHaveLength(1)
+    expect(twoViolations([['80'], ['10'], ['18']], run, 3, 1, false)).toEqual([]) // nothing excluded
     expect(threeViolations([['081', '218']], run, 1, 2, false)).toEqual([])
     expect(threeViolations([['081', '229']], run, 1, 2, false)).toHaveLength(1)
     expect(threeViolations([['081'], ['212']], run, 2, 1, false)).toEqual([])
@@ -434,6 +446,379 @@ describe('2 ตัว / 3 ตัว row rules', () => {
     expect(genTwo(1e9, 1, [8, 1])).toHaveLength(90)
     expect(genTwo(-3, 2, [8, 1])).toEqual([])
     expect(genTwo(1.9, 2.9, [8, 1]).map((r) => r.length)).toEqual([2])
+  })
+})
+
+describe('2 ตัว leaves out a 2-digit เลขเด่น and its reverse', () => {
+  const reversed = (s: string) => s[1] + s[0]
+  /** What the rule keeps out of the block: the number and its reverse (only 77 for 77). */
+  const keptOut = (s: string) => (reversed(s) === s ? [s] : [s, reversed(s)])
+  /** FIXED_CASES plus the รูด 4 - 1 of the customer's example. */
+  const RUNNINGS: [number | undefined, number | undefined][] = [...FIXED_CASES, [4, 1]]
+  /** Every shape up to 4 rows: 1-4 rows x perRow 1-6. */
+  const SHAPES: [number, number][] = []
+  for (const rows of [1, 2, 3, 4]) for (let perRow = 1; perRow <= 6; perRow++) SHAPES.push([rows, perRow])
+  const tally = (counts: Map<string, number>, t: string) => counts.set(t, (counts.get(t) ?? 0) + 1)
+  /** Uniform over exactly `pool`, and every number of it was drawn at least once. */
+  const expectAllUniform = (counts: Map<string, number>, pool: string[]) => {
+    expectUniform(counts, pool)
+    for (const s of pool) expect(counts.get(s) ?? 0, `${s} never drawn`).toBeGreaterThan(0)
+  }
+
+  /** `fn` with crypto.getRandomValues replaced by a seeded stream, so two calls see the same randomness. */
+  function withSeed<T>(seed: number, fn: () => T): T {
+    let a = seed | 0
+    const next = () => {
+      a = (a + 0x6d2b79f5) | 0
+      let t = Math.imul(a ^ (a >>> 15), 1 | a)
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+      return (t ^ (t >>> 14)) >>> 0
+    }
+    const spy = vi.spyOn(globalThis.crypto, 'getRandomValues').mockImplementation(((buf: Uint32Array) => {
+      for (let i = 0; i < buf.length; i++) buf[i] = next()
+      return buf
+    }) as typeof crypto.getRandomValues)
+    try {
+      return fn()
+    } finally {
+      spy.mockRestore()
+    }
+  }
+
+  it('same random stream: 2 ตัว is exactly what genTwo draws alone (with the two excluded values for a 2-digit เลขเด่น)', () => {
+    for (let seed = 1; seed <= 200; seed++) {
+      const rows = 1 + (seed % 4)
+      const perRow = 1 + (seed % 6)
+      const isDouble = seed % 2 === 0
+      const base = { fixed: [4, 1] as [number, number], two: { row: rows, perRow, isDouble } }
+      const plain = withSeed(seed, () => genTwo(rows, perRow, [4, 1], { isDouble }))
+      const kept = withSeed(seed, () => genTwo(rows, perRow, [4, 1], { isDouble, exclude: ['41', '14'] }))
+      // 1 and 3 digits: the very draw there would be with no เลขเด่น, as today
+      for (const digits of [1, 3]) {
+        expect(withSeed(seed, () => generateCardNumbers({ ...base, single: { digits } })).two).toEqual(plain)
+      }
+      // 2 digits (default r1 r2 or a fixed 41 / 14): that draw with 41 and 14 handed in, and nothing
+      // else drawn before it, so the เลขเด่น is not drawn a second time
+      expect(withSeed(seed, () => generateCardNumbers(base)).two).toEqual(kept)
+      for (const fixed of ['41', '14']) {
+        expect(withSeed(seed, () => generateCardNumbers({ ...base, single: { digits: 2, fixed } })).two).toEqual(kept)
+      }
+    }
+  })
+
+  it('same random stream: a 1 or 3 digit เลขเด่น is drawn after every block, so the blocks do not depend on it', () => {
+    for (let seed = 1; seed <= 100; seed++) {
+      const cfg = (single: { digits: number; fixed?: string }) => ({
+        top: { row: 1, perRow: 2 },
+        two: { row: 3, perRow: 4, isDouble: seed % 2 === 0 },
+        three: { row: 3, perRow: 4 },
+        drill: { row: 2, perRow: 2 },
+        win: { row: 2, digitCount: 5 },
+        single,
+      })
+      // a fixed เลขเด่น takes no random draw at all, so the others must come out as it shows
+      const none = withSeed(seed, () => generateCardNumbers(cfg({ digits: 1, fixed: '5' })))
+      const one = withSeed(seed, () => generateCardNumbers(cfg({ digits: 1 })))
+      const three = withSeed(seed, () => generateCardNumbers(cfg({ digits: 3 })))
+      expect({ ...one, single: '' }).toEqual({ ...none, single: '' })
+      expect({ ...three, single: '' }).toEqual({ ...none, single: '' })
+    }
+  })
+
+  it('twoExclusions: a 2-digit number and its reverse (just the number for 77), nothing for 1 or 3 digits', () => {
+    expect(twoExclusions('41')).toEqual(['41', '14'])
+    expect(twoExclusions('14')).toEqual(['14', '41'])
+    expect(twoExclusions('07')).toEqual(['07', '70'])
+    expect(twoExclusions('93')).toEqual(['93', '39'])
+    expect(twoExclusions('77')).toEqual(['77'])
+    expect(twoExclusions('00')).toEqual(['00'])
+    for (const v of ['4', '', '413', '4a', ' 41', '41 ', undefined]) {
+      expect(twoExclusions(v), String(v)).toEqual([])
+    }
+  })
+
+  it('default เลขเด่น r1 r2: it and its reverse are in no row (rows 1-4, perRow 1-6, เลขเบิ้ล on / off, random and fixed รูด)', () => {
+    const bad: string[] = []
+    let draws = 0
+    for (const fixed of RUNNINGS) {
+      for (const [rows, perRow] of SHAPES) {
+        for (const isDouble of [false, true]) {
+          for (let i = 0; i < 12; i++) {
+            const n = generateCardNumbers({ fixed, two: { row: rows, perRow, isDouble } })
+            const at = `[running ${n.running.join('')}, ${rows} x ${perRow}, isDouble ${isDouble}]`
+            draws++
+            // the number that is kept out is exactly the one returned as single
+            if (n.single !== n.running[0] + n.running[1]) bad.push(`${at} single is ${n.single}`)
+            // every older rule still holds too: rows full, rules A and C, no repeats
+            for (const v of twoViolations(n.two, n.running, rows, perRow, isDouble, keptOut(n.single))) {
+              bad.push(`${at} ${v}`)
+            }
+          }
+        }
+      }
+    }
+    expect(draws).toBeGreaterThan(4000)
+    expect(bad.slice(0, 10)).toEqual([])
+  })
+
+  it('a fixed 2-digit เลขเด่น and its reverse are in no row: unrelated to the รูด (93), r1 r2 (41), repeated (77), leading zero (07)', () => {
+    // รูด 4 - 1 is the example; the other รูด cases are random or fixed slots (FIXED_CASES)
+    const singles = ['93', '39', '41', '14', '77', '44', '11', '00', '07', '70', '40', '10', '01', '99']
+    const bad: string[] = []
+    let draws = 0
+    for (const fixedSingle of singles) {
+      for (const fixed of RUNNINGS) {
+        for (const [rows, perRow] of SHAPES) {
+          for (const isDouble of [false, true]) {
+            const n = generateCardNumbers({
+              fixed,
+              two: { row: rows, perRow, isDouble },
+              single: { digits: 2, fixed: fixedSingle },
+            })
+            const at = `[fixed ${fixedSingle}, running ${n.running.join('')}, ${rows} x ${perRow}, isDouble ${isDouble}]`
+            draws++
+            if (n.single !== fixedSingle) bad.push(`${at} single is ${n.single}`)
+            for (const v of twoViolations(n.two, n.running, rows, perRow, isDouble, keptOut(fixedSingle))) {
+              bad.push(`${at} ${v}`)
+            }
+          }
+        }
+      }
+    }
+    expect(draws).toBeGreaterThan(4000)
+    expect(bad.slice(0, 10)).toEqual([])
+  })
+
+  it('worst case for every รูด pair and every 2-digit เลขเด่น: rule rows still hold perRow 6 (smallest pool is 8)', () => {
+    // 90 running pairs x 100 fixed values x เลขเบิ้ล on / off, two rows of 6 (the two rule rows are
+    // the small pools), each drawn once
+    const bad: string[] = []
+    let draws = 0
+    for (let r1 = 0; r1 < 10; r1++) {
+      for (let r2 = 0; r2 < 10; r2++) {
+        if (r1 === r2) continue
+        for (const fixedSingle of TWO_DIGIT) {
+          for (const isDouble of [false, true]) {
+            const n = generateCardNumbers({
+              fixed: [r1, r2],
+              two: { row: 2, perRow: 6, isDouble },
+              single: { digits: 2, fixed: fixedSingle },
+            })
+            draws++
+            const found = twoViolations(n.two, n.running, 2, 6, isDouble, keptOut(fixedSingle))
+            if (found.length) bad.push(`[running ${r1}${r2}, fixed ${fixedSingle}, isDouble ${isDouble}] ${found[0]}`)
+          }
+        }
+      }
+    }
+    expect(draws).toBe(90 * 100 * 2)
+    expect(bad.slice(0, 10)).toEqual([])
+  })
+
+  it('does not depend on the เลขเด่น element being shown: visible, hidden and unset behave alike', () => {
+    const bad: string[] = []
+    for (const visible of [true, false, undefined]) {
+      for (const fixedSingle of [undefined, '93', '14', '77']) {
+        const want = fixedSingle ?? '41'
+        for (let i = 0; i < 150; i++) {
+          const n = generateForSettings({
+            fixedRunning1: 4,
+            fixedRunning2: 1,
+            fixedSingle,
+            elements: { single: { visible }, two: { row: 3, perRow: 6 } },
+          })
+          const at = `[visible ${visible}, fixed ${fixedSingle}]`
+          if (n.single !== want) bad.push(`${at} single is ${n.single}, want ${want}`)
+          for (const v of twoViolations(n.two, n.running, 3, 6, false, keptOut(want))) bad.push(`${at} ${v}`)
+        }
+      }
+    }
+    expect(bad.slice(0, 10)).toEqual([])
+  })
+
+  it('a fixedSingle that does not count (wrong length, not digits) keeps r1 r2 and its reverse out, as no fixed value', () => {
+    const bad: string[] = []
+    for (const fixedSingle of ['9', '939', '9x', '', ' ', null]) {
+      for (let i = 0; i < 100; i++) {
+        const n = generateForSettings({
+          fixedRunning1: 4,
+          fixedRunning2: 1,
+          fixedSingle,
+          elements: { two: { row: 3, perRow: 6 } },
+        })
+        const at = `[fixedSingle ${JSON.stringify(fixedSingle)}]`
+        if (n.single !== '41') bad.push(`${at} single is ${n.single}`)
+        for (const v of twoViolations(n.two, n.running, 3, 6, false, ['41', '14'])) bad.push(`${at} ${v}`)
+      }
+    }
+    expect(bad.slice(0, 10)).toEqual([])
+  })
+
+  it('a 1 or 3 digit เลขเด่น excludes nothing: r1 r2 and r2 r1 (and 93 / 39 too) still show up in the 2 ตัว block', () => {
+    const cases: CardSettings[] = [
+      { singleDigits: 1 },
+      { singleDigits: 3 },
+      { singleDigits: 1, fixedSingle: '4' },
+      { singleDigits: 3, fixedSingle: '413' },
+      // a fixed value counts only at exactly singleDigits digits: these 2-digit ones are ignored
+      { singleDigits: 1, fixedSingle: '41' },
+      { singleDigits: 3, fixedSingle: '93' },
+    ]
+    const draws = 600
+    for (const settings of cases) {
+      let n41 = 0
+      let n14 = 0
+      let n93 = 0
+      let n39 = 0
+      for (let i = 0; i < draws; i++) {
+        const { two } = generateForSettings({
+          ...settings,
+          fixedRunning1: 4,
+          fixedRunning2: 1,
+          elements: { two: { row: 4, perRow: 6 } },
+        })
+        // row 1 takes 6 of the 9 numbers starting with 4, row 2 6 of the 9 starting with 1 (2 in 3
+        // hold 41 / 14); rows 3 and 4 take 12 of the 78 left (about 1 in 6.5 holds 93 / 39)
+        if (two[0].includes('41')) n41++
+        if (two[1].includes('14')) n14++
+        if (two.slice(2).flat().includes('93')) n93++
+        if (two.slice(2).flat().includes('39')) n39++
+      }
+      const at = JSON.stringify(settings)
+      expect(n41, `41 in row 1 ${at}`).toBeGreaterThan(draws * 0.5)
+      expect(n14, `14 in row 2 ${at}`).toBeGreaterThan(draws * 0.5)
+      expect(n93, `93 in rows 3-4 ${at}`).toBeGreaterThan(draws * 0.07)
+      expect(n39, `39 in rows 3-4 ${at}`).toBeGreaterThan(draws * 0.07)
+    }
+  })
+
+  it('with a 1 or 3 digit เลขเด่น each rule row is still uniform over its whole pool, 41 and 14 included', () => {
+    for (const digits of [1, 3]) {
+      const row1 = new Map<string, number>()
+      const row2 = new Map<string, number>()
+      for (let i = 0; i < 9000; i++) {
+        const [[a], [b]] = generateCardNumbers({ fixed: [4, 1], two: { row: 2, perRow: 1 }, single: { digits } }).two
+        tally(row1, a)
+        tally(row2, b)
+      }
+      expectAllUniform(row1, TWO_DIGIT.filter((s) => s[0] === '4' && !isRepeated(s))) // 9 numbers
+      expectAllUniform(row2, TWO_DIGIT.filter((s) => s[0] === '1' && !isRepeated(s)))
+    }
+  })
+
+  it('every number the rules still allow stays equally likely, and all of them appear', () => {
+    // default เลขเด่น 41 for รูด 4 - 1: row 1 loses 41, row 2 loses 14 (44 / 11 only with เลขเบิ้ล)
+    for (const isDouble of [false, true]) {
+      const row1 = new Map<string, number>()
+      const row2 = new Map<string, number>()
+      for (let i = 0; i < 9000; i++) {
+        const [[a], [b]] = generateCardNumbers({ fixed: [4, 1], two: { row: 2, perRow: 1, isDouble } }).two
+        tally(row1, a)
+        tally(row2, b)
+      }
+      const allowed = (lead: string, out: string) =>
+        TWO_DIGIT.filter((s) => s[0] === lead && s !== out && (isDouble || !isRepeated(s)))
+      expect(allowed('4', '41')).toHaveLength(isDouble ? 9 : 8)
+      expectAllUniform(row1, allowed('4', '41'))
+      expectAllUniform(row2, allowed('1', '14'))
+    }
+
+    // one row of three: each of the 16 numbers starting with 4 or 1 (no 41, 14, 44, 11) is as likely
+    const one = new Map<string, number>()
+    for (let i = 0; i < 8000; i++) {
+      for (const t of generateCardNumbers({ fixed: [4, 1], two: { row: 1, perRow: 3 } }).two[0]) tally(one, t)
+    }
+    expectAllUniform(
+      one,
+      TWO_DIGIT.filter((s) => (s[0] === '4' || s[0] === '1') && !isRepeated(s) && s !== '41' && s !== '14'),
+    )
+
+    // fixed 93 is unrelated to รูด 4 - 1, so rows 1 and 2 keep their whole 9-number pools and row 3 is
+    // uniform over what no rule row can take (not 4x / 1x, no doubles, no 93 / 39): 70 numbers
+    const row1 = new Map<string, number>()
+    const row2 = new Map<string, number>()
+    const row3 = new Map<string, number>()
+    let leaked = 0
+    for (let i = 0; i < 15_000; i++) {
+      const [[a], [b], [c]] = generateCardNumbers({
+        fixed: [4, 1],
+        two: { row: 3, perRow: 1 },
+        single: { digits: 2, fixed: '93' },
+      }).two
+      tally(row1, a)
+      tally(row2, b)
+      if (c[0] !== '4' && c[0] !== '1') tally(row3, c) // a 4x / 1x left over has its own odds
+      if (c === '93' || c === '39') leaked++
+    }
+    expect(leaked).toBe(0)
+    expectAllUniform(row1, TWO_DIGIT.filter((s) => s[0] === '4' && !isRepeated(s)))
+    expectAllUniform(row2, TWO_DIGIT.filter((s) => s[0] === '1' && !isRepeated(s)))
+    const outside = TWO_DIGIT.filter(
+      (s) => s[0] !== '4' && s[0] !== '1' && !isRepeated(s) && s !== '93' && s !== '39',
+    )
+    expect(outside).toHaveLength(70)
+    expectAllUniform(row3, outside)
+
+    // fixed 77 is its own reverse: only 77 leaves row 1 of รูด 7 - 4 (with เลขเบิ้ล on); 74, 47, 44 stay
+    const dbl1 = new Map<string, number>()
+    const dbl2 = new Map<string, number>()
+    for (let i = 0; i < 10_000; i++) {
+      const [[a], [b]] = generateCardNumbers({
+        fixed: [7, 4],
+        two: { row: 2, perRow: 1, isDouble: true },
+        single: { digits: 2, fixed: '77' },
+      }).two
+      tally(dbl1, a)
+      tally(dbl2, b)
+    }
+    expectAllUniform(dbl1, TWO_DIGIT.filter((s) => s[0] === '7' && s !== '77')) // 9 numbers
+    expectAllUniform(dbl2, TWO_DIGIT.filter((s) => s[0] === '4')) // 10 numbers
+  })
+
+  it('genTwo exclude: never drawn, top-ups included; anything that is not a 2-digit number is ignored', () => {
+    const out = ['41', '14', '93', '39']
+    for (let i = 0; i < RUNS; i++) {
+      // perRow 12 outgrows the rule rows: each keeps its whole pool (4x / 1x without the doubles and
+      // 41 / 14: 8 numbers), then the top-up and row 3 fill the rest
+      const two = genTwo(3, 12, [4, 1], { exclude: out })
+      expect(two.map((r) => r.length)).toEqual([12, 12, 12])
+      expect(new Set(two.flat()).size).toBe(36)
+      for (const t of out) expect(two.flat(), t).not.toContain(t)
+      expect(two.flat().some(isRepeated)).toBe(false)
+      for (const d of [0, 2, 3, 5, 6, 7, 8, 9]) {
+        expect(two[0], `4${d} in row 1`).toContain(`4${d}`)
+        expect(two[1], `1${d} in row 2`).toContain(`1${d}`)
+      }
+
+      // one row: the 16 numbers starting with 4 or 1 first, then 14 top-ups that start with neither
+      const one = genTwo(1, 30, [4, 1], { exclude: out })
+      expect(one[0]).toHaveLength(30)
+      expect(new Set(one[0]).size).toBe(30)
+      for (const t of out) expect(one[0], t).not.toContain(t)
+      expect(one[0].filter((t) => t[0] === '4' || t[0] === '1')).toHaveLength(16)
+
+      // an excluded double leaves a block that allows doubles; 77 is its own reverse, so 74 / 47 stay
+      const dbl = genTwo(2, 10, [7, 4], { isDouble: true, exclude: ['77'] })
+      expect(dbl.map((r) => r.length)).toEqual([10, 10])
+      expect(dbl.flat()).not.toContain('77')
+      expect(dbl[0]).toContain('74')
+      expect(dbl[1]).toContain('47')
+      expect(dbl[1]).toContain('44')
+    }
+
+    // asked for more than is left: 120 asked, 90 - 2 = 88 allowed numbers exist
+    const big = genTwo(6, 20, [4, 1], { exclude: ['41', '14'] })
+    expect(big.map((r) => r.length)).toEqual([20, 20, 20, 20, 8])
+    expect(new Set(big.flat()).size).toBe(88)
+    expect(big.flat()).not.toContain('41')
+    expect(big.flat()).not.toContain('14')
+
+    // only 2-digit entries count: '7' is not '07' (it lies in row 1 of รูด 0 - 1 about 1 time in 3)
+    let seen07 = 0
+    for (let i = 0; i < 300; i++) {
+      if (genTwo(1, 6, [0, 1], { exclude: ['7', '007', '0x', ''] })[0].includes('07')) seen07++
+    }
+    expect(seen07).toBeGreaterThan(50)
   })
 })
 

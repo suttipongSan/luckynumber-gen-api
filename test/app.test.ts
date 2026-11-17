@@ -3704,4 +3704,61 @@ describe('review: 2 ตัว / 3 ตัว row rules and runningDouble', () => 
       }
     })
   })
+
+  it('POST /render/numbers keeps a 2-digit เลขเด่น and its reverse out of 2 ตัว (shown or hidden); 1 and 3 digits leave 2 ตัว alone', async () => {
+    const admin = await adminCookie()
+    const m = await newMember(admin, 'single-out-of-two')
+    // the member's own limit, so the shared test DB's default limit cannot get in the way
+    expect((await call('PATCH', `/admin/members/${m.id}`, admin, { renderLimit: 1000 })).status).toBe(200)
+    const settings = (extra: object, visible: boolean) => ({
+      fixedRunning1: 4,
+      fixedRunning2: 1,
+      ...extra,
+      // 6 x 6 is the biggest 2 ตัว block, so it leaves the most room for a number to leak in
+      elements: { single: { visible }, two: { row: 6, perRow: 6 } },
+    })
+    const render = (extra: object, visible: boolean, count: number) =>
+      renderAll(
+        m.cookie,
+        Array.from({ length: count }, () => ({ lotteryId: 'dow-jones', settings: settings(extra, visible) })),
+      )
+
+    // 2 digits: the default r1 r2 (41) and fixed ones (93 shares no digit with รูด 4 - 1, 77 is its own reverse)
+    const cases: [object, boolean, string][] = [
+      [{}, true, '41'],
+      [{}, false, '41'],
+      [{ fixedSingle: '93' }, true, '93'],
+      [{ fixedSingle: '93' }, false, '93'],
+      [{ fixedSingle: '77', isDouble: true }, false, '77'],
+    ]
+    for (const [extra, visible, want] of cases) {
+      const at = `${JSON.stringify(extra)}, เลขเด่น shown ${visible}`
+      for (const n of await render(extra, visible, 10)) {
+        const all = n.two.flat()
+        expect(n.single, at).toBe(want)
+        expect(all, at).not.toContain(want)
+        expect(all, at).not.toContain(want[1] + want[0])
+        expect(n.two.map((r) => r.length), at).toEqual(Array(6).fill(6))
+        expect(new Set(all).size, at).toBe(36)
+        expect(n.two[0].every((t) => t[0] === '4'), at).toBe(true)
+        expect(n.two[1].every((t) => t[0] === '1'), at).toBe(true)
+      }
+    }
+
+    // 1 and 3 digits take nothing out: over 40 renders 41 (row 1) and 14 (row 2) both turn up
+    for (const singleDigits of [1, 3]) {
+      const rendered = await render({ singleDigits }, false, 40)
+      expect(rendered.some((n) => n.two[0].includes('41')), `${singleDigits} digit(s): 41`).toBe(true)
+      expect(rendered.some((n) => n.two[1].includes('14')), `${singleDigits} digit(s): 14`).toBe(true)
+    }
+
+    // saved settings are read the same way
+    expect((await call('PUT', '/settings/dow-jones', m.cookie, settings({ fixedSingle: '93' }, false))).status).toBe(200)
+    const saved = await renderAll(m.cookie, Array.from({ length: 10 }, () => ({ lotteryId: 'dow-jones' })))
+    for (const n of saved) {
+      expect(n.single).toBe('93')
+      expect(n.two.flat()).not.toContain('93')
+      expect(n.two.flat()).not.toContain('39')
+    }
+  })
 })
