@@ -1,13 +1,17 @@
 // POST /render/numbers — the gate. Verifies session + expiry (middleware), enforces the
 // per-member daily limit (members.render_limit ?? site_settings.render_limit_default ??
 // RENDERS_PER_DAY), generates numbers server-side and returns short-lived signed asset URLs.
+// When the request carries a `scope` the drawn numbers are also saved for the card date
+// (member_draws, read back by GET /draws).
 import { Hono } from 'hono'
 import { and, eq, inArray, isNull, or, sql } from 'drizzle-orm'
 import type { BatchItem } from 'drizzle-orm/batch'
 import type { AppEnv, CardNumbers, CardSettings } from '../types'
+import { DRAW_SCOPE_SINGLE } from '../types'
 import { getDb } from '../db/client'
-import { assets, cardSettings, lotteries, members, renderCounters, siteSettings } from '../db/schema'
+import { assets, cardSettings, lotteries, members, renderCounters, sets, siteSettings } from '../db/schema'
 import { requireMember } from '../middleware/memberAuth'
+import { saveDraws } from '../lib/draws'
 import { errors, parseJson } from '../lib/http'
 import { generateForSettings } from '../lib/numbers'
 import { signedAssetUrl } from '../lib/crypto'
@@ -56,12 +60,13 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   // Saved settings are needed only for items without an override.
   const needSaved = ids.filter((id) => body.items.some((i) => i.lotteryId === id && !i.settings))
 
-  // Read batch (one D1 round trip) — all four reads are independent, so asset ownership no
+  // Read batch (one D1 round trip) — all the reads are independent, so asset ownership no
   // longer waits on the settings result:
   //   1) lottery-id validation (inline memberLotteryIds — one chunk, see above)
   //   2) card_settings for this member's ids that need saved settings
   //   3) the member's assets (max 2 × 3 kinds = 6 rows, assets_member_idx)
   //   4) the admin-configured default render limit (site_settings PK lookup)
+  //   5) only when the request names a set as its `scope`: that the set is this member's
   const lotteryQ = db
     .select({ id: lotteries.id })
     .from(lotteries)
@@ -87,9 +92,20 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
     .select({ value: siteSettings.value })
     .from(siteSettings)
     .where(eq(siteSettings.key, RENDER_LIMIT_DEFAULT))
+  // `scope` is where the drawn numbers are saved (member_draws): 'single' needs no check, anything
+  // else must be one of this member's sets. Appended last so the positions above do not move.
+  const scope = body.scope
+  const scopeQ =
+    scope !== undefined && scope !== DRAW_SCOPE_SINGLE
+      ? db
+          .select({ id: sets.id })
+          .from(sets)
+          .where(and(eq(sets.id, scope), eq(sets.memberId, member.id)))
+      : null
   const readOps: BatchSqlite[] = settingsQ
     ? [lotteryQ, settingsQ, assetsQ, defaultLimitQ]
     : [lotteryQ, assetsQ, defaultLimitQ]
+  if (scopeQ) readOps.push(scopeQ)
   const readRes = (await db.batch(readOps as [BatchSqlite, ...BatchSqlite[]])) as unknown[]
   const knownRows = readRes[0] as { id: string }[]
   const settingsRows = (settingsQ ? readRes[1] : []) as { lotteryId: string; settingsJson: string }[]
@@ -103,6 +119,10 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   const known = new Set(knownRows.map((r) => r.id))
   const missing = ids.filter((i) => !known.has(i))
   if (missing.length) throw errors.notFound(`ไม่พบหวย: ${missing.slice(0, 5).join(', ')}`)
+  // A set that is gone (deleted in another tab) or not theirs: refused before anything is counted.
+  if (scopeQ && (readRes[readOps.length - 1] as unknown[]).length === 0) {
+    throw errors.notFound('ไม่พบชุดรายการ')
+  }
 
   const saved = new Map<string, CardSettings>()
   for (const r of settingsRows) saved.set(r.lotteryId, parseSettingsJson(r.settingsJson))
@@ -152,6 +172,18 @@ renderRoutes.post('/render/numbers', requireMember(), async (c) => {
   const counters = writeRes[0] as { count: number }[]
   const counter = counters[0]
   if (!counter) throw errors.rateLimited(`ใช้งานครบ ${limit} ครั้งต่อวันแล้ว`)
+
+  // Keep a copy of what was drawn so the page can show it again after a reload (GET /draws). It
+  // only happens for an allowed render (an over-limit one threw above) and never fails the call:
+  // the numbers are generated and counted already, losing their copy only means the page falls
+  // back to its browser cache.
+  if (scope !== undefined) {
+    try {
+      await saveDraws(db, member.id, scope, body.date, results)
+    } catch (err) {
+      console.error('render: saving the drawn numbers failed', err)
+    }
+  }
 
   // Sign only assets that belong to this member (ownership already resolved by the read
   // batch). `signedAssetUrl` buckets exp to the next 30-min boundary so repeat renders inside a bucket

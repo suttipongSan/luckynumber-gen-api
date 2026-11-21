@@ -265,10 +265,11 @@ describe('migration 0007', () => {
     const journal = JSON.parse(readFileSync('drizzle/meta/_journal.json', 'utf8')) as {
       entries: { idx: number; tag: string; when: number }[]
     }
-    const last = journal.entries[journal.entries.length - 1]
-    expect(last.tag).toBe('0007_add_article_pages')
-    expect(last.idx).toBe(7)
-    expect(last.when).toBeGreaterThan(journal.entries[journal.entries.length - 2].when)
+    // by position, not "the last entry": later migrations (0008 ...) come after it
+    const entry = journal.entries[7]
+    expect(entry.tag).toBe('0007_add_article_pages')
+    expect(entry.idx).toBe(7)
+    expect(entry.when).toBeGreaterThan(journal.entries[6].when)
     const snap = (n: string) => JSON.parse(readFileSync(`drizzle/meta/${n}_snapshot.json`, 'utf8')) as { id: string; prevId: string }
     expect(snap('0007').prevId).toBe(snap('0006').id)
     const cols = (JSON.parse(readFileSync('drizzle/meta/0007_snapshot.json', 'utf8')) as {

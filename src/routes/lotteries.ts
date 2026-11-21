@@ -5,7 +5,14 @@ import { and, eq, isNull, or, sql } from 'drizzle-orm'
 import type { AppEnv, Lottery } from '../types'
 import { MAX_CUSTOM_LOTTERIES } from '../types'
 import { getDb } from '../db/client'
-import { cardSettings, lotteries, memberNotifications, setLotteries } from '../db/schema'
+import {
+  cardSettings,
+  lotteries,
+  lotteryResults,
+  memberDraws,
+  memberNotifications,
+  setLotteries,
+} from '../db/schema'
 import { GROUP_ORDER } from '../db/catalog'
 import { requireMember } from '../middleware/memberAuth'
 import { changedRows, errors, parseJson } from '../lib/http'
@@ -139,11 +146,16 @@ lotteryRoutes.delete('/lotteries/:id', async (c) => {
   const row = await ownedLottery(db, memberId, id)
   // Cascade manually so another member's sets / settings referencing this lottery (which cannot
   // happen through the member API) are also cleaned up, as a defence in depth. The reminder
-  // lines for this lottery go with it.
+  // lines for this lottery go with it, and so do the member's saved draws of it (only this member
+  // can have drawn it, and the member filter keeps the delete on the primary key of member_draws)
+  // and the results typed for it (only this member can have; the lottery filter keeps the delete on
+  // the unique index of lottery_results).
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.lotteryId, row.id)),
     db.delete(cardSettings).where(eq(cardSettings.lotteryId, row.id)),
     db.delete(memberNotifications).where(eq(memberNotifications.lotteryId, row.id)),
+    db.delete(memberDraws).where(and(eq(memberDraws.memberId, memberId), eq(memberDraws.lotteryId, row.id))),
+    db.delete(lotteryResults).where(eq(lotteryResults.lotteryId, row.id)),
     db
       .delete(lotteries)
       .where(and(eq(lotteries.id, row.id), eq(lotteries.ownerMemberId, memberId))),

@@ -9,16 +9,21 @@ import { linkRoutes } from './routes/link'
 import { meRoutes } from './routes/me'
 import { bootstrapRoutes } from './routes/bootstrap'
 import { contactsRoutes } from './routes/contacts'
+import { drawRoutes } from './routes/draws'
 import { landingRoutes } from './routes/landing'
 import { lotteryRoutes } from './routes/lotteries'
 import { newsRoutes } from './routes/news'
+import { resultRoutes } from './routes/results'
 import { setRoutes } from './routes/sets'
 import { settingsRoutes } from './routes/settings'
 import { renderRoutes } from './routes/render'
 import { assetRoutes } from './routes/assets'
 import { notificationRoutes } from './routes/notifications'
 import { pushRoutes } from './routes/push'
+import { publicDataRoutes } from './routes/publicData'
 import { adminRoutes } from './routes/admin'
+import { runScheduledPrune } from './lib/draws'
+import { runScheduledPublish } from './lib/publicPublish'
 import { runScheduledReminders } from './lib/reminders'
 
 const DEV_ORIGIN = 'http://localhost:5173'
@@ -43,6 +48,11 @@ export function allowedOrigins(env: { WEB_URL?: string; COOKIE_SECURE?: string }
 }
 
 export const app = new Hono<AppEnv>()
+
+// Local development only (a 404 when COOKIE_SECURE is 'true'): the snapshot files of the public results
+// site, read from the PUBLIC_RESULTS bucket. Registered first, so the CORS / CSRF / test-stack middleware
+// below does not run for it (it sets its own `Access-Control-Allow-Origin: *`).
+app.route('/public-data', publicDataRoutes)
 
 app.use('*', async (c, next) => {
   const allowed = allowedOrigins(c.env)
@@ -82,9 +92,11 @@ app.route('/', contactsRoutes)
 app.route('/', landingRoutes)
 app.route('/', lotteryRoutes)
 app.route('/', newsRoutes)
+app.route('/', resultRoutes)
 app.route('/', setRoutes)
 app.route('/', settingsRoutes)
 app.route('/', renderRoutes)
+app.route('/', drawRoutes)
 app.route('/', assetRoutes)
 app.route('/', notificationRoutes)
 app.route('/', pushRoutes)
@@ -100,18 +112,37 @@ app.onError((err, c) => {
 
 /**
  * Cloudflare cron trigger (wrangler.toml [triggers], every minute): sends the daily reminders that
- * are due. Does nothing until the VAPID keys are configured. A thrown error is logged and
+ * are due (nothing until the VAPID keys are configured), in the 03:17 Bangkok minute deletes the
+ * member_draws rows older than 14 days (src/lib/draws.ts) and reconciles the public results snapshots
+ * (src/lib/publicPublish.ts: one cheap read when results_version equals results_published_version, a
+ * bounded build otherwise; nothing at all without the PUBLIC_RESULTS binding). The jobs are
+ * independent: one that throws is logged and does not stop the others, then the first error is
  * rethrown so the failed run shows up in the Workers dashboard.
  */
 export async function scheduled(controller: { scheduledTime: number }, env: Bindings): Promise<void> {
+  // scheduledTime is the minute the trigger was due; never run behind it, so a trigger that
+  // fires a moment early still handles its own minute.
+  const now = Math.max(Date.now(), controller.scheduledTime)
+  const failures: unknown[] = []
   try {
-    // scheduledTime is the minute the trigger was due; never run behind it, so a trigger that
-    // fires a moment early still handles its own minute.
-    await runScheduledReminders(env, Math.max(Date.now(), controller.scheduledTime))
+    await runScheduledReminders(env, now)
   } catch (err) {
     console.error('scheduled reminders failed', err)
-    throw err
+    failures.push(err)
   }
+  try {
+    await runScheduledPrune(env, controller.scheduledTime, now)
+  } catch (err) {
+    console.error('scheduled draw cleanup failed', err)
+    failures.push(err)
+  }
+  try {
+    await runScheduledPublish(env, now)
+  } catch (err) {
+    console.error('scheduled public snapshots failed', err)
+    failures.push(err)
+  }
+  if (failures.length > 0) throw failures[0]
 }
 
 // Workers call default.fetch and default.scheduled. The Hono app already has fetch; adding

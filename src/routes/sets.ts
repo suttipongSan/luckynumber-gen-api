@@ -7,7 +7,7 @@ import type { AppEnv, LotterySet } from '../types'
 import { MAX_SETS } from '../types'
 import { getDb, type DB } from '../db/client'
 import { chunk, IN_CHUNK } from '../lib/chunk'
-import { lotteries, setLotteries, sets } from '../db/schema'
+import { lotteries, memberDraws, setLotteries, sets } from '../db/schema'
 import { STARTER_SETS } from '../db/starterSets'
 import { requireMember } from '../middleware/memberAuth'
 import { changedRows, errors, parseJson } from '../lib/http'
@@ -343,8 +343,10 @@ setRoutes.delete('/sets/:id', async (c) => {
   const db = getDb(c.env)
   const row = await ownedSet(db, c.get('member').id, c.req.param('id'))
   if (row.isDefault) throw errors.conflict('DEFAULT_LOCKED', 'ไม่สามารถลบชุดหลักได้')
+  // The saved draws of this set (member_draws.scope = the set id, no foreign key possible) go too.
   await db.batch([
     db.delete(setLotteries).where(eq(setLotteries.setId, row.id)),
+    db.delete(memberDraws).where(and(eq(memberDraws.memberId, row.memberId), eq(memberDraws.scope, row.id))),
     db.delete(sets).where(eq(sets.id, row.id)),
   ])
   return c.body(null, 204)

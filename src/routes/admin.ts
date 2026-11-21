@@ -1,6 +1,7 @@
 // Back office API (operator). Cookie `ng_admin`; everything except login/logout requires it.
 import { Hono } from 'hono'
 import { and, asc, desc, eq, inArray, isNull, like, lt, or, sql } from 'drizzle-orm'
+import type { BatchItem } from 'drizzle-orm/batch'
 import type { AdminNews, AdminSettings, AppEnv, AssetBucket } from '../types'
 import { getDb, type DB } from '../db/client'
 import {
@@ -9,6 +10,9 @@ import {
   cardSettings,
   loginAttempts,
   lotteries,
+  lotteryResults,
+  lotterySchedules,
+  memberDraws,
   memberNotifications,
   memberSessions,
   members,
@@ -39,6 +43,8 @@ import {
   reserveAttempt,
 } from '../lib/loginLimiter'
 import { newId, newToken } from '../lib/ids'
+import { recordChangeStatements } from '../lib/publicChange'
+import { schedulePublish } from '../lib/publicPublish'
 import {
   CONTACT_LINE_ID,
   CONTACT_LINE_URL,
@@ -66,6 +72,10 @@ import {
   patchNewsSchema,
 } from '../validation'
 import { adminLandingRoutes } from './adminLanding'
+import { adminPublicRoutes } from './adminPublic'
+import { adminResultRoutes } from './results'
+
+type BatchSqlite = BatchItem<'sqlite'>
 
 export const adminRoutes = new Hono<AppEnv>()
 
@@ -241,8 +251,10 @@ adminRoutes.delete('/members/:id', async (c) => {
   if (!row) throw errors.notFound('ไม่พบสมาชิก')
   const setIds = db.select({ id: sets.id }).from(sets).where(eq(sets.memberId, id))
   // F5: also drop this member's custom lotteries and the set_lotteries / card_settings /
-  // member_notifications rows that reference them (across all members, defence in depth — only
-  // this member can create them). The member's own reminder lines and push devices go too.
+  // member_notifications / lottery_results rows that reference them (across all members, defence
+  // in depth — only this member can create them). The member's own reminder lines, saved draws
+  // (all scopes, the ones of their custom lotteries included), personal results and push devices
+  // go too.
   const customLotteryIds = db
     .select({ id: lotteries.id })
     .from(lotteries)
@@ -263,6 +275,13 @@ adminRoutes.delete('/members/:id', async (c) => {
     db.delete(memberNotifications).where(inArray(memberNotifications.lotteryId, customLotteryIds)),
     db.delete(pushSubscriptions).where(eq(pushSubscriptions.memberId, id)),
     db.delete(memberSessions).where(eq(memberSessions.memberId, id)),
+    // Before the member (a foreign key of member_draws); AFTER the assets statement, whose result
+    // is read by position below.
+    db.delete(memberDraws).where(eq(memberDraws.memberId, id)),
+    // The member's personal results (lottery_results.member_id has no foreign key: '' is the
+    // official result) and every result of their custom lotteries, before those lotteries go.
+    db.delete(lotteryResults).where(eq(lotteryResults.memberId, id)),
+    db.delete(lotteryResults).where(inArray(lotteryResults.lotteryId, customLotteryIds)),
     db.delete(lotteries).where(eq(lotteries.ownerMemberId, id)),
     db.delete(members).where(eq(members.id, id)),
   ])
@@ -338,7 +357,13 @@ adminRoutes.post('/lotteries', async (c) => {
     notifyTime,
     notifyEnabled,
   }
-  await db.insert(lotteries).values(row)
+  // A new lottery that is active is public from the start (public_enabled defaults to on): the public
+  // results site lists it, so the change is counted and its file marked in the same batch.
+  await db.batch([
+    db.insert(lotteries).values(row),
+    ...(row.active ? recordChangeStatements(db, nowIso(), { lotteryIds: [row.id] }) : []),
+  ] as [BatchSqlite, ...BatchSqlite[]])
+  if (row.active) await schedulePublish(c)
   return c.json(toAdminLottery(row))
 })
 
@@ -355,23 +380,47 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
   if (body.active !== undefined) patch.active = body.active
   if (body.notifyTime !== undefined) patch.notifyTime = body.notifyTime
   if (body.notifyEnabled !== undefined) patch.notifyEnabled = body.notifyEnabled
+  const current = await db.query.lotteries.findFirst({
+    where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
+  })
+  if (!current) throw errors.notFound('ไม่พบหวย')
   if (body.notifyTime !== undefined || body.notifyEnabled !== undefined) {
     // Check the state the lottery will be in, not only the fields that were sent (e.g. clearing
     // the time of a lottery whose reminder is on).
-    const current = await db.query.lotteries.findFirst({
-      where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
-    })
-    if (!current) throw errors.notFound('ไม่พบหวย')
     checkNotifyState(
       body.notifyTime !== undefined ? body.notifyTime : current.notifyTime,
       body.notifyEnabled !== undefined ? body.notifyEnabled : current.notifyEnabled,
     )
   }
   if (Object.keys(patch).length) {
-    await db
-      .update(lotteries)
-      .set(patch)
-      .where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)))
+    // What the public results site shows of a lottery: name, short name, group, accent, order and
+    // whether it is shown at all (active + public_enabled). Only a real change of one of them, of a
+    // lottery that is public before or after, counts (the reminder columns never do). A lottery that
+    // appears or disappears also changes every day file that holds its results, so those are marked.
+    const after = { ...current, ...patch }
+    const wasPublic = current.active && current.publicEnabled
+    const isPublic = after.active && after.publicEnabled
+    const shown =
+      current.name !== after.name ||
+      current.shortName !== after.shortName ||
+      current.groupKey !== after.groupKey ||
+      current.accent !== after.accent ||
+      current.sortOrder !== after.sortOrder ||
+      wasPublic !== isPublic
+    const counts = shown && (wasPublic || isPublic)
+    await db.batch([
+      db
+        .update(lotteries)
+        .set(patch)
+        .where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId))),
+      ...(counts
+        ? recordChangeStatements(db, nowIso(), {
+            lotteryIds: [id],
+            allDatesOfLottery: wasPublic !== isPublic ? id : undefined,
+          })
+        : []),
+    ] as [BatchSqlite, ...BatchSqlite[]])
+    if (counts) await schedulePublish(c)
   }
   const row = await db.query.lotteries.findFirst({
     where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
@@ -387,12 +436,23 @@ adminRoutes.delete('/lotteries/:id', async (c) => {
     where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
   })
   if (!row) throw errors.notFound('ไม่พบหวย')
-  await db.batch([
+  // Its results (the official ones and every member's personal ones), its schedule rows and the
+  // members' saved draws of it go with it. A public lottery that disappears changes the public files:
+  // the change is counted FIRST in the batch (the marks read the dates of its results, which the
+  // deletes below remove), so its file is removed and its day files are rebuilt without it.
+  const wasPublic = row.active && row.publicEnabled
+  const stmts: BatchSqlite[] = [
+    ...(wasPublic ? recordChangeStatements(db, nowIso(), { lotteryIds: [id], allDatesOfLottery: id }) : []),
     db.delete(setLotteries).where(eq(setLotteries.lotteryId, id)),
     db.delete(cardSettings).where(eq(cardSettings.lotteryId, id)),
     db.delete(memberNotifications).where(eq(memberNotifications.lotteryId, id)),
+    db.delete(memberDraws).where(eq(memberDraws.lotteryId, id)),
+    db.delete(lotteryResults).where(eq(lotteryResults.lotteryId, id)),
+    db.delete(lotterySchedules).where(eq(lotterySchedules.lotteryId, id)),
     db.delete(lotteries).where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId))),
-  ])
+  ]
+  await db.batch(stmts as [BatchSqlite, ...BatchSqlite[]])
+  if (wasPublic) await schedulePublish(c)
   return c.body(null, 204)
 })
 
@@ -552,3 +612,11 @@ adminRoutes.put('/settings', async (c) => {
 // ---- landing page (public GET /landing): /admin/landing/*, registered after requireAdmin above
 
 adminRoutes.route('/landing', adminLandingRoutes)
+
+// ---- lottery results (GET /admin/results?date=): PUT and DELETE are /results, see ./results
+
+adminRoutes.route('/results', adminResultRoutes)
+
+// ---- the public results site (publicEnabled, schedules, status): /admin/public/*, see ./adminPublic
+
+adminRoutes.route('/public', adminPublicRoutes)

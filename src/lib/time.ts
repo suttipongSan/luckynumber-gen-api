@@ -22,9 +22,23 @@ export function bangkokMinute(nowMs = Date.now()): string {
   return new Date(nowMs + BANGKOK_OFFSET_MS).toISOString().slice(0, 16)
 }
 
+/** `day` (`YYYY-MM-DD`, a real calendar day) moved by `delta` days: the calendar day, not a 24 h instant. */
+export function addDays(day: string, delta: number): string {
+  return new Date(Date.parse(`${day}T00:00:00Z`) + delta * 86_400_000).toISOString().slice(0, 10)
+}
+
 /** `minute` (see {@link bangkokMinute}) moved by `delta` minutes. */
 export function addMinutes(minute: string, delta: number): string {
   return new Date(Date.parse(`${minute}:00Z`) + delta * 60_000).toISOString().slice(0, 16)
+}
+
+/**
+ * True for a real calendar day written exactly `YYYY-MM-DD` (years 1000..9999): not February 30,
+ * not month 13, not a date-time and not free-form text. Used for the dates that become keys
+ * (lottery results, saved draws).
+ */
+export function isCalendarDay(value: string): boolean {
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) && parseIsoDateTime(value) !== null
 }
 
 export function isExpired(expiresAt: string, nowMs = Date.now()): boolean {

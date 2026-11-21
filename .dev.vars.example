@@ -22,6 +22,8 @@ ADMIN_PASSWORD_HASH='pbkdf2$100000$<salt-base64>$<hash-base64>'
 WEB_URL=http://localhost:5173
 
 # 'true' in production (Secure; SameSite=None cookies), 'false' for local http dev (SameSite=Lax).
+# 'false' also turns on GET /public-data/* (the snapshot files of the public results site, read from the local
+# PUBLIC_RESULTS bucket); with 'true' that route is a 404, so it never exists in production.
 COOKIE_SECURE=false
 
 # Web Push for the daily reminders. `npm run vapid:generate` prints a key pair (it writes no file).
@@ -31,3 +33,10 @@ COOKIE_SECURE=false
 # VAPID_PRIVATE_KEY=
 # Optional contact for the push services (mailto: or https: URL). Default: https://pnphoto.co
 # VAPID_SUBJECT=mailto:you@example.com
+
+# Key of the results robot: PUT /results accepts it in the X-API-Key header (a signed-in admin can write results
+# without it). A long random string, e.g.
+#   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+# In production set it with `npx wrangler secret put RESULTS_API_KEY`, and again with `--env test` for the test
+# Worker (secrets are per Worker). Unset or empty: the key path refuses every key.
+# RESULTS_API_KEY=change-me-long-random-string

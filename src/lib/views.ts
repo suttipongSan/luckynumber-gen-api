@@ -13,9 +13,13 @@ type LotteryRow = typeof lotteries.$inferSelect
 /**
  * Maps a lottery row to the API shape. Pass the requesting `memberId` to set `custom: true`
  * when the lottery is owned by that member. Admin / public callers omit the id and get
- * `custom: false`. The reminder columns are not part of the member shape (see toAdminLottery).
+ * `custom: false`. The reminder columns and the public-site switch are not part of the member shape
+ * (see toAdminLottery, and GET /admin/public/lotteries for the switch).
  */
-export function toLottery(r: Omit<LotteryRow, 'notifyTime' | 'notifyEnabled'>, memberId?: string): Lottery {
+export function toLottery(
+  r: Omit<LotteryRow, 'notifyTime' | 'notifyEnabled' | 'publicEnabled'>,
+  memberId?: string,
+): Lottery {
   return {
     id: r.id,
     name: r.name,
@@ -29,7 +33,7 @@ export function toLottery(r: Omit<LotteryRow, 'notifyTime' | 'notifyEnabled'>, m
 }
 
 /** Back office shape: the lottery plus its default daily reminder (`GET /admin/lotteries`). */
-export function toAdminLottery(r: LotteryRow): AdminLottery {
+export function toAdminLottery(r: Omit<LotteryRow, 'publicEnabled'>): AdminLottery {
   return { ...toLottery(r), notifyTime: r.notifyTime, notifyEnabled: r.notifyEnabled }
 }
 
@@ -92,6 +96,18 @@ export async function rendersTodayMap(db: DB, memberIds: string[]): Promise<Map<
     for (const r of rows) out.set(r.memberId, r.count)
   }
   return out
+}
+
+/**
+ * WHERE condition for a query on `lotteries`: the lotteries a member can see, i.e. the active
+ * catalog lotteries (`owner_member_id IS NULL`) plus their own private ones (what `GET /lotteries`
+ * lists). Used by the readers of lottery results.
+ */
+export function visibleToMember(memberId: string) {
+  return or(
+    and(isNull(lotteries.ownerMemberId), eq(lotteries.active, true)),
+    eq(lotteries.ownerMemberId, memberId),
+  )
 }
 
 /**

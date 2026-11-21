@@ -57,6 +57,27 @@
       "when": 1794676011228,
       "tag": "0007_add_article_pages",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1795026190009,
+      "tag": "0008_add_results_and_draws",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1795099283298,
+      "tag": "0009_add_personal_results",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1795194867069,
+      "tag": "0010_add_public_results",
+      "breakpoints": true
     }
   ]
 }
