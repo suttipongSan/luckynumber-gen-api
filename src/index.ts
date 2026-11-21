@@ -124,6 +124,12 @@ export async function scheduled(controller: { scheduledTime: number }, env: Bind
   // fires a moment early still handles its own minute.
   const now = Math.max(Date.now(), controller.scheduledTime)
   const failures: unknown[] = []
+  // The test Worker shares the live database. While it has a schedule (it publishes the public results files
+  // until the live Worker does), it must never send the reminders or clean up the draws a second time.
+  if (env.TEST_STACK === 'true') {
+    await runScheduledPublish(env, now)
+    return
+  }
   try {
     await runScheduledReminders(env, now)
   } catch (err) {

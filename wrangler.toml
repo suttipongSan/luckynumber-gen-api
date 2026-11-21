@@ -95,5 +95,13 @@ enabled = true
 
 # No schedule on the test Worker: only production sends the daily push messages and cleans up the saved draws
 # (the table is shared, so the live Worker's trigger cleans it for both).
+# TEMPORARY, until the live Worker is deployed with the public results code: the test Worker publishes the
+# snapshot files of the public results site (bucket pnresult-public) and has a schedule for that. On the test
+# Worker the schedule ONLY publishes (src/index.ts, TEST_STACK): the reminders and the draw clean-up stay with
+# production. Remove this binding and set crons = [] again when the live Worker takes over.
+[[env.test.r2_buckets]]
+binding = "PUBLIC_RESULTS"
+bucket_name = "pnresult-public"
+
 [env.test.triggers]
-crons = []
+crons = ["* * * * *"]
