@@ -12,10 +12,11 @@ workers_dev = false
 # Secrets (SESSION_SECRET, ASSET_SIGNING_SECRET, ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and the Web Push keys
 # VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY from `npm run vapid:generate`) are set with `wrangler secret put <NAME>`.
 # Optional var VAPID_SUBJECT (a mailto: or https: contact URL for the push services; default https://pnphoto.co).
-# Optional secret RESULTS_API_KEY: the key of the results robot, sent as the X-API-Key header of PUT /results
-# (a long random string, e.g. `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`).
-# Without it the key is refused and only a signed-in admin can write results. The test Worker needs its own
-# copy: `wrangler secret put RESULTS_API_KEY --env test` (see [env.test] below).
+# Secret RESULTS_ADMIN_SECRET (at least 32 characters, e.g. `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`):
+# signs the 10 minute admin tokens that GET /admin/results-token hands to the back office for the results API
+# (numbergen-results-api), which must hold the SAME value. Without it that endpoint answers 503. The test Worker needs its own
+# copy: `wrangler secret put RESULTS_ADMIN_SECRET --env test` (see [env.test] below). (The results robot's
+# RESULTS_API_KEY and the public results snapshots are the results API's now, not this Worker's.)
 [vars]
 # First origin is used in member links; every listed origin is allowed by CORS.
 WEB_URL = "https://pnphoto.co"
@@ -33,16 +34,6 @@ migrations_dir = "drizzle"
 binding = "ASSETS"
 bucket_name = "numbergen-assets"
 
-# The snapshot files of the OFFICIAL lottery results that the free public results site reads (src/lib/publicSnapshot.ts,
-# src/lib/publicPublish.ts). Public data only, nothing of the members. Create the bucket once before deploying:
-#   npx wrangler r2 bucket create pnresult-public
-# and serve it on an R2 custom domain (README, "Public results snapshots"). In `wrangler dev` this binding is a local
-# simulation, read through GET /public-data/* (only while COOKIE_SECURE is not 'true'). Optional in the code: a Worker
-# without it publishes nothing. The test Worker below deliberately has no such binding.
-[[r2_buckets]]
-binding = "PUBLIC_RESULTS"
-bucket_name = "pnresult-public"
-
 [observability]
 enabled = true
 
@@ -58,9 +49,9 @@ crons = ["* * * * *"]
 # before it goes live. It uses the SAME D1 database and R2 bucket as production, so everything
 # done there is real data, and migrations must already be applied (`npm run db:migrate:remote`).
 # Bindings and vars are not inherited by an environment, so they are repeated here.
-# Secrets are per Worker: set each one again with `wrangler secret put <NAME> --env test`. That includes the
-# optional RESULTS_API_KEY (PUT /results): leave it unset here if only an admin should write results through the
-# test site, or give it its own key (a result written through either Worker is the same row in the shared D1).
+# Secrets are per Worker: set each one again with `wrangler secret put <NAME> --env test`. That includes
+# RESULTS_ADMIN_SECRET (the same value as on the live Worker and on the results API), or the test back office cannot get
+# its token for the results API (GET /admin/results-token answers 503).
 [env.test]
 name = "numbergen-api-test"
 routes = [{ pattern = "api-test.pnphoto.co", custom_domain = true }]
@@ -85,23 +76,10 @@ migrations_dir = "drizzle"
 binding = "ASSETS"
 bucket_name = "numbergen-assets"
 
-# NO PUBLIC_RESULTS binding here, on purpose: this Worker never publishes snapshot files. But the D1 database is shared: a
-# result written through this Worker bumps results_version in the shared site_settings, and the live Worker's cron then
-# publishes it to the public site. To stop all publishing (for example while testing with fake results) set the
-# site_settings switch public_results_enabled to "false" first: PUT /admin/public/enabled {"enabled": false} (README).
-
 [env.test.observability]
 enabled = true
 
 # No schedule on the test Worker: only production sends the daily push messages and cleans up the saved draws
 # (the table is shared, so the live Worker's trigger cleans it for both).
-# TEMPORARY, until the live Worker is deployed with the public results code: the test Worker publishes the
-# snapshot files of the public results site (bucket pnresult-public) and has a schedule for that. On the test
-# Worker the schedule ONLY publishes (src/index.ts, TEST_STACK): the reminders and the draw clean-up stay with
-# production. Remove this binding and set crons = [] again when the live Worker takes over.
-[[env.test.r2_buckets]]
-binding = "PUBLIC_RESULTS"
-bucket_name = "pnresult-public"
-
 [env.test.triggers]
-crons = ["* * * * *"]
+crons = []

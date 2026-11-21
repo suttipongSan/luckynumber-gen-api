@@ -14,7 +14,6 @@ import {
   MAX_NOTIFICATION_ITEMS,
   MAX_ROUND,
   MIN_ROUND,
-  RESULT_FIELDS,
 } from './types'
 import { LANDING_COLOR_RE, isLandingSlug } from './lib/landing'
 import { sanitizeHtml } from './lib/sanitizeHtml'
@@ -453,8 +452,8 @@ export const pushUnsubscribeSchema = z.object({ endpoint: z.string().min(1).max(
 const CALENDAR_DAY_MESSAGE = 'ต้องเป็นวันที่รูปแบบ YYYY-MM-DD ที่มีอยู่จริง เช่น 2026-11-19'
 const calendarDay = z.string({ error: CALENDAR_DAY_MESSAGE }).refine(isCalendarDay, CALENDAR_DAY_MESSAGE)
 
-// PUT /results (the official result, robot or admin) and PUT /results/mine (a member's own result)
-// share these rules. The numbers are STRINGS of digits (a JSON number would lose a leading zero) and
+// PUT /results/mine (a member's own result) follows the rules of the official PUT /results of the results API
+// (numbergen-results-api/src/validation.ts: the robot and the back office), which are kept the same. The numbers are STRINGS of digits (a JSON number would lose a leading zero) and
 // strictly ASCII digits of the exact length: top3 3 digits, top2 and bottom2 2 digits. No trimming.
 // `null` counts as "not given" for every optional field, so a client that writes absent values as
 // null is not refused. Unknown keys are refused (a typo such as `bottom_2` must not be dropped
@@ -489,28 +488,8 @@ function needOneResultNumber(
   }
 }
 
-export const putResultSchema = z
-  .strictObject({
-    lotteryId: z.string().min(1).max(64).nullable().optional(),
-    lotteryName: z.string().trim().min(1).max(80).nullable().optional(),
-    date: calendarDay,
-    time: resultTime,
-    ...resultNumbers,
-    source: z.string().trim().max(200).nullable().optional(),
-  })
-  .superRefine((val, ctx) => {
-    if ((val.lotteryId == null) === (val.lotteryName == null)) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['lotteryId'],
-        message: 'ต้องระบุ lotteryId หรือ lotteryName อย่างใดอย่างหนึ่งเท่านั้น',
-      })
-    }
-    needOneResultNumber(val, ctx)
-  })
-
 // PUT /results/mine: a member types their own result. The date, time and digit rules are those of
-// PUT /results; the lottery is named by id only (a member's own lottery names may repeat a catalog
+// the official PUT /results (results API); the lottery is named by id only (a member's own lottery names may repeat a catalog
 // name), there is no `source` and nothing that says whose result it is (it is always the caller's),
 // so any other key is refused.
 export const putMyResultSchema = z
@@ -530,7 +509,7 @@ export const myResultQuerySchema = z.object({
   time: resultTime,
 })
 
-// GET /results?date= and GET /admin/results?date=: the one required query parameter.
+// GET /results?date=: the one required query parameter (the results API's GET /admin/results has the same).
 export const resultsQuerySchema = z.object({ date: calendarDay })
 
 // GET /draws?date=&scope=: the card date and, optionally, repeated `scope` parameters ('single'
@@ -539,78 +518,3 @@ export const drawsQuerySchema = z.object({
   date: calendarDay,
   scope: z.array(drawScope).max(MAX_DRAW_SCOPES, `ระบุ scope ได้ไม่เกิน ${MAX_DRAW_SCOPES} ค่า`).optional(),
 })
-
-// ---- the public results site (back office) ---------------------------------------------------------
-
-// A draw time of a schedule row: '' (the lottery draws once a day) or "HH:MM"; it must match the `time` of
-// the results of that draw, so it follows the rules of PUT /results.
-const SCHEDULE_DRAW_TIME_MESSAGE = 'drawTime ต้องอยู่ในรูปแบบ HH:MM (00:00-23:59) หรือเว้นว่างสำหรับหวยที่ออกวันละครั้ง'
-const scheduleDrawTime = z
-  .string({ error: SCHEDULE_DRAW_TIME_MESSAGE })
-  .refine((v) => v === '' || NOTIFY_TIME_RE.test(v), SCHEDULE_DRAW_TIME_MESSAGE)
-
-const allUnique = (list: readonly unknown[]) => new Set(list).size === list.length
-
-// PUT /admin/public/lotteries/:id/schedules: one draw time of a lottery, replaced as a whole. Every field is
-// required and unknown keys are refused (closedDate has its own endpoint, so re-saving the times never
-// clears the "no draw today" switch). `days` are ISO weekdays, 1 = Monday .. 7 = Sunday, each at most once;
-// `expectedFields` is a non-empty subset of top3 / top2 / bottom2, each at most once.
-export const putScheduleSchema = z.strictObject({
-  drawTime: scheduleDrawTime,
-  resultTime: z
-    .string({ error: 'resultTime ต้องอยู่ในรูปแบบ HH:MM (00:00-23:59)' })
-    .regex(NOTIFY_TIME_RE, 'resultTime ต้องอยู่ในรูปแบบ HH:MM (00:00-23:59)'),
-  days: z
-    .array(z.number({ error: 'days ต้องเป็นตัวเลข 1-7 (1 = จันทร์ ... 7 = อาทิตย์)' }).int().min(1).max(7), {
-      error: 'days ต้องเป็นรายการตัวเลข 1-7 (1 = จันทร์ ... 7 = อาทิตย์)',
-    })
-    .min(1, 'days ต้องมีอย่างน้อยหนึ่งวัน')
-    .max(7)
-    .refine(allUnique, 'days ห้ามซ้ำกัน'),
-  expectedFields: z
-    .array(z.enum(RESULT_FIELDS, { error: 'expectedFields ต้องเป็น top3, top2 หรือ bottom2' }), {
-      error: 'expectedFields ต้องเป็นรายการของ top3, top2, bottom2',
-    })
-    .min(1, 'expectedFields ต้องมีอย่างน้อยหนึ่งช่อง')
-    .max(3)
-    .refine(allUnique, 'expectedFields ห้ามซ้ำกัน'),
-})
-
-// DELETE /admin/public/lotteries/:id/schedules?drawTime= : which row. The parameter must be present; an empty
-// one names the row of a lottery that draws once a day.
-export const scheduleKeyQuerySchema = z.object({ drawTime: scheduleDrawTime })
-
-// PUT /admin/public/lotteries/:id/schedules/closed: sets (a real day, YYYY-MM-DD) or clears (null) the "no
-// draw on this date" switch of one schedule row.
-export const scheduleClosedSchema = z.strictObject({ drawTime: scheduleDrawTime, closedDate: calendarDay.nullable() })
-
-// PATCH /admin/public/lotteries/:id
-export const patchPublicLotterySchema = z.strictObject({ publicEnabled: z.boolean() })
-
-// PUT /admin/public/enabled: the public_results_enabled switch.
-export const publicEnabledSchema = z.strictObject({ enabled: z.boolean() })
-
-// POST /admin/public/publish: optionally mark everything for a rebuild first (`allDays` = every date that has
-// results, not only the last two weeks), then run one bounded publishing pass. `passes` (1..30, default 1) runs
-// up to that many passes in the one request while marks are left: for local development, where nothing limits a
-// request; on the Workers Free plan one request can afford only one pass (see README).
-export const publishSchema = z.strictObject({
-  rebuild: z.boolean().optional(),
-  allDays: z.boolean().optional(),
-  passes: z.number().int().min(1).max(30).optional(),
-})
-
-// POST /admin/results/import: pasted text OR rows (exactly one of the two). The rows themselves are checked
-// one by one by the import (a bad row is a line of the report, not a 400), so they are only required to be a
-// list here; the number of rows is checked there too.
-export const importResultsSchema = z
-  .strictObject({
-    dryRun: z.boolean().optional(),
-    csv: z.string({ error: 'csv ต้องเป็นข้อความ' }).optional(),
-    rows: z.array(z.unknown(), { error: 'rows ต้องเป็นรายการ' }).optional(),
-  })
-  .superRefine((val, ctx) => {
-    if ((val.csv === undefined) === (val.rows === undefined)) {
-      ctx.addIssue({ code: 'custom', path: ['csv'], message: 'ต้องส่ง csv หรือ rows อย่างใดอย่างหนึ่งเท่านั้น' })
-    }
-  })

@@ -44,7 +44,7 @@ import {
 } from '../lib/loginLimiter'
 import { newId, newToken } from '../lib/ids'
 import { recordChangeStatements } from '../lib/publicChange'
-import { schedulePublish } from '../lib/publicPublish'
+import { signAdminToken, usableSecret } from '../lib/adminToken'
 import {
   CONTACT_LINE_ID,
   CONTACT_LINE_URL,
@@ -72,8 +72,6 @@ import {
   patchNewsSchema,
 } from '../validation'
 import { adminLandingRoutes } from './adminLanding'
-import { adminPublicRoutes } from './adminPublic'
-import { adminResultRoutes } from './results'
 
 type BatchSqlite = BatchItem<'sqlite'>
 
@@ -127,6 +125,27 @@ adminRoutes.post('/logout', async (c) => {
 adminRoutes.use('*', requireAdmin)
 
 adminRoutes.get('/me', (c) => c.json({ username: c.get('adminUser') }))
+
+// ---- the token for the results API
+
+// The results API (numbergen-results-api) is a Worker of its own that does not know the ng_admin cookie. The signed-in
+// admin asks here for a short-lived token (10 minutes) and sends it to the results API as `Authorization: Bearer <token>`.
+// The format is src/lib/adminToken.ts; the secret RESULTS_ADMIN_SECRET (at least 32 characters) is the same one the
+// results API has. Without a usable secret there is nothing to sign: 503 with its own code (the web app can say that
+// the results API is not set up), and the results API refuses every token. The test Worker needs the secret too.
+adminRoutes.get('/results-token', async (c) => {
+  const secret = usableSecret(c.env.RESULTS_ADMIN_SECRET)
+  if (secret === null) {
+    throw errors.unavailable(
+      'RESULTS_TOKEN_NOT_CONFIGURED',
+      'ยังไม่ได้ตั้งค่า RESULTS_ADMIN_SECRET (อย่างน้อย 32 ตัวอักษร) จึงออกโทเค็นสำหรับ results API ไม่ได้',
+    )
+  }
+  const { token, expiresAt } = await signAdminToken(secret)
+  // a token is a credential: never cached, not by the browser and not by a proxy
+  c.header('Cache-Control', 'no-store')
+  return c.json({ token, expiresAt })
+})
 
 // ---- members
 
@@ -358,12 +377,12 @@ adminRoutes.post('/lotteries', async (c) => {
     notifyEnabled,
   }
   // A new lottery that is active is public from the start (public_enabled defaults to on): the public
-  // results site lists it, so the change is counted and its file marked in the same batch.
+  // results site lists it, so the change is counted and its file marked in the same batch. DB only: the results API's
+  // cron publishes it within a minute (src/lib/publicChange.ts).
   await db.batch([
     db.insert(lotteries).values(row),
     ...(row.active ? recordChangeStatements(db, nowIso(), { lotteryIds: [row.id] }) : []),
   ] as [BatchSqlite, ...BatchSqlite[]])
-  if (row.active) await schedulePublish(c)
   return c.json(toAdminLottery(row))
 })
 
@@ -396,7 +415,8 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
     // What the public results site shows of a lottery: name, short name, group, accent, order and
     // whether it is shown at all (active + public_enabled). Only a real change of one of them, of a
     // lottery that is public before or after, counts (the reminder columns never do). A lottery that
-    // appears or disappears also changes every day file that holds its results, so those are marked.
+    // appears or disappears also changes every day file that holds its results, so those are marked. Recorded
+    // only (the results API publishes it within a minute).
     const after = { ...current, ...patch }
     const wasPublic = current.active && current.publicEnabled
     const isPublic = after.active && after.publicEnabled
@@ -420,7 +440,6 @@ adminRoutes.patch('/lotteries/:id', async (c) => {
           })
         : []),
     ] as [BatchSqlite, ...BatchSqlite[]])
-    if (counts) await schedulePublish(c)
   }
   const row = await db.query.lotteries.findFirst({
     where: and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId)),
@@ -452,7 +471,6 @@ adminRoutes.delete('/lotteries/:id', async (c) => {
     db.delete(lotteries).where(and(eq(lotteries.id, id), isNull(lotteries.ownerMemberId))),
   ]
   await db.batch(stmts as [BatchSqlite, ...BatchSqlite[]])
-  if (wasPublic) await schedulePublish(c)
   return c.body(null, 204)
 })
 
@@ -612,11 +630,3 @@ adminRoutes.put('/settings', async (c) => {
 // ---- landing page (public GET /landing): /admin/landing/*, registered after requireAdmin above
 
 adminRoutes.route('/landing', adminLandingRoutes)
-
-// ---- lottery results (GET /admin/results?date=): PUT and DELETE are /results, see ./results
-
-adminRoutes.route('/results', adminResultRoutes)
-
-// ---- the public results site (publicEnabled, schedules, status): /admin/public/*, see ./adminPublic
-
-adminRoutes.route('/public', adminPublicRoutes)

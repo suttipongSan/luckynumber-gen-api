@@ -5,6 +5,12 @@ Cloudflare R2 for member assets, zod validation, vitest tests.
 
 The HTTP contract is `../numbergen/API.md` and the agreed design is `../numbergen/DESIGN.md`.
 
+**Split (2026-11-21).** The official lottery results and everything that feeds the free public results site moved to a Worker of
+its own, **`numbergen-results-api`** (repo `../numbergen-results-api`, Worker `results-api`), on the same D1 database. This API keeps
+the members, cards, sets, assets, landing page, push reminders, saved draws, the lottery **catalogue** admin, `GET /results` and the members'
+own results, the admin login, the database **schema and its migrations**, and one new endpoint, `GET /admin/results-token`. See
+"Public results and the results API" below for who owns what, the token flow, the local run and the deploy order.
+
 ## Layout
 
 ```
@@ -25,27 +31,26 @@ src/lib/landing.ts      public landing page: landing_* settings keys + defaults,
 src/lib/sanitizeHtml.ts allowlist HTML sanitizer for the long text of an article (tokenizer + element stack, no DOM, linear time)
 src/lib/webpush.ts      Web Push for Workers (WebCrypto only): VAPID JWT, RFC 8291 encryption, push-service allow-list, sender
 src/lib/reminders.ts    the per-minute cron: cursor, "who is due" query, notification text, sending, cleanup
-src/lib/results.ts      lottery results: row -> JSON, the upsert, which results a member reads (their own win over the official one), lookups of the lottery
+src/lib/results.ts      lottery results as members meet them: row -> JSON, the upsert of a personal result, which results a member reads (their own win over the official one)
 src/lib/draws.ts        a member's last drawn numbers (member_draws): save, read, the daily 14-day cleanup
-src/lib/publicSnapshot.ts  the public results snapshots: the ONE public filter + field whitelist, file shapes, final / partial state, statistics, the builders
-src/lib/publicChange.ts    version counter + dirty marks + the atomic official-result writes ("really changed" rule), status, kill switch
-src/lib/publicPublish.ts   the bounded build to the PUBLIC_RESULTS bucket, the guard against an older build, the cron reconcile
-src/lib/resultsImport.ts   bulk import of old official results (CSV text or rows, row-by-row report, dry run)
-src/middleware/         memberAuth (session + expiry/disabled check on every call), adminAuth, resultsAuth (X-API-Key or admin)
+src/lib/publicChange.ts    DB-only record of a catalogue change for the public results site (results_version + dirty marks); the results API publishes it
+src/lib/adminToken.ts   the signed admin token for the results API (sign here, verify there; IDENTICAL file in both repos)
+src/middleware/         memberAuth (session + expiry/disabled check on every call), adminAuth
 src/routes/             link, me, bootstrap, contacts, landing, lotteries, news, sets, settings, render, assets, push, notifications,
-                        results (official results + the members' own, /results/mine), draws, publicData (GET /public-data/*, local dev only),
-                        admin (+ adminLanding, mounted at /admin/landing, adminResultRoutes, at /admin/results, and adminPublic, at /admin/public,
-                        behind the same admin guard)
+                        results (GET /results + the members' own results, /results/mine), draws,
+                        admin (+ adminLanding, mounted at /admin/landing, behind the same admin guard; GET /admin/results-token)
 drizzle/                generated SQL migrations
 scripts/                seed-sql (writes seed.sql for D1), hash-password, vapid-generate, db (test helpers)
-test/                   vitest: numbers, crypto/signed URLs, app (app.request + file:test.db + fake R2),
+test/                   vitest (test/helpers/officialResult.ts puts an official result in the database, the way the results API stores one): numbers, crypto/signed URLs, app (app.request + file:test.db + fake R2),
                         notifications (reminder + push endpoints), reminders (cron logic), webpush (RFC 8291 / VAPID),
                         landing (public landing page + its back office, own file:test-landing.db),
                         articles (article pages: migration 0007, slug / long text / date rules, own file:test-articles.db),
-                        results (PUT / GET / DELETE /results, key and admin auth, migrations 0008 / 0009, own file:test-results.db),
+                        results (GET /results, migrations 0008 / 0009, a catalog lottery delete taking its results, own file:test-results.db),
                         memberResults (the members' own results: PUT / DELETE /results/mine, precedence over the official result, isolation, cascades, own file:test-memberresults.db),
                         draws (saved draws, GET /draws, the 14-day cleanup, cascades, own file:test-draws.db),
-                        publicSnapshot / publicPublish / publicPrivacy / publicAdmin / publicBudget (the public results snapshots, see "Public results snapshots"; helpers in test/helpers),
+                        migration0010 (the schema of the public results site, which this repo owns),
+                        catalogueRecording (a catalogue change is RECORDED in D1 and never published here: the cross-check vector shared with the results API, which changes count, no bucket access),
+                        adminToken (the token format, the cross-check vector shared with the results API) / resultsToken (GET /admin/results-token),
                         sanitizeHtml (the HTML sanitizer: adversarial tables, random inputs, linear-time checks)
 ```
 
@@ -71,6 +76,10 @@ secrets and paste a hash from `npm run hash-password -- admin1234` (keep it in s
 ```powershell
 npm run dev    # the Worker on http://localhost:8787; D1 and R2 are simulated locally by wrangler
 ```
+
+`.dev.vars` also needs `RESULTS_ADMIN_SECRET` (at least 32 characters, the same value as in the `.dev.vars` of `numbergen-results-api`) for
+`GET /admin/results-token`; `.dev.vars.example` documents it. The results API runs next to this one on **http://localhost:8788** (see "Public results and the
+results API"). Local ports: this API 8787, the results API 8788, the web app 5173; the results site runs on its own dev server.
 
 Tests run in Node against a libSQL file DB (`file:test.db`) with the same schema and migrations.
 
@@ -102,7 +111,7 @@ Live on the operator's Cloudflare account (all free plan):
 | Worker | `numbergen-api` → https://api.pnphoto.co |
 | Database | D1 `numbergen` (binding `DB`, APAC) |
 | Files | R2 bucket `numbergen-assets` (binding `ASSETS`, private; member assets are only served through signed URLs, and only the `landing/` prefix is public, through `GET /landing/image/:name`) |
-| Public results | R2 bucket `pnresult-public` (binding `PUBLIC_RESULTS`, public data only, served on an R2 custom domain; the test Worker has no such binding), see "Public results snapshots" |
+| Results API | Worker `results-api` (repo `../numbergen-results-api`): the official results, `/admin/public/*`, the snapshot files in R2 `pnresult-public` and their cron. Same D1 database; this Worker has no binding to that bucket. See "Public results and the results API" |
 | Web origin | `WEB_URL` in wrangler.toml → https://pnphoto.co (comma-separated list; first one is used in member links) |
 
 Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`
@@ -110,19 +119,20 @@ Secrets: `SESSION_SECRET`, `ASSET_SIGNING_SECRET`, `ADMIN_USERNAME`, `ADMIN_PASS
 For daily reminders also set `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (`npm run vapid:generate` prints
 both and the commands); `VAPID_SUBJECT` (a `mailto:` or `https:` contact, default `https://pnphoto.co`) is optional.
 `wrangler.toml` has a cron trigger that runs every minute; the reminders do nothing until both VAPID keys exist. The same
-trigger deletes the saved draws older than 14 days once a day (03:17 Bangkok time), which needs no key, and reconciles the public
-results snapshots (one read per minute when nothing changed; nothing without the `PUBLIC_RESULTS` binding).
-For the results robot set `RESULTS_API_KEY` (a long random string, for example
-`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`; the robot sends it as the `X-API-Key`
-header of `PUT /results`). It is optional: without it the key is refused and only a signed-in admin can write results.
+trigger deletes the saved draws older than 14 days once a day (03:17 Bangkok time), which needs no key. (Publishing the public
+results is the results API's cron, not this one.)
+For the results API set `RESULTS_ADMIN_SECRET` (at least 32 characters, for example
+`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`): it signs the 10 minute tokens of `GET /admin/results-token`
+and must be **exactly the same** on `results-api`. Without it that endpoint answers `503 RESULTS_TOKEN_NOT_CONFIGURED`.
 Secrets belong to one Worker each, so the test Worker (`--env test`) needs its own copy of every secret it should have,
-`RESULTS_API_KEY` included: `npx wrangler secret put RESULTS_API_KEY` and `npx wrangler secret put RESULTS_API_KEY --env test`
-(the two Workers share the D1 database, so a result written through either one is the same row). For local development
-put `RESULTS_API_KEY=...` in `.dev.vars` (`.dev.vars.example` documents it).
+`RESULTS_ADMIN_SECRET` included: `npx wrangler secret put RESULTS_ADMIN_SECRET` and `npx wrangler secret put RESULTS_ADMIN_SECRET --env test`
+(the results API serves both back offices). The results robot's `RESULTS_API_KEY` is the results API's now: once the robot calls that
+API, remove the old copies from this repo's Workers (`npx wrangler secret delete RESULTS_API_KEY`, and `--env test`).
+For local development put `RESULTS_ADMIN_SECRET=...` in `.dev.vars` (`.dev.vars.example` documents it).
 `TEST_STACK` is a plain var (not a secret) that is the string `"true"` (quoted; a TOML boolean does not count) only
 on the separate test Worker `numbergen-api-test` (https://api-test.pnphoto.co: the same code deployed with
 `wrangler --env test`, same D1 database). Leave it unset everywhere else, including the live Worker; see
-"Test site switch" under Behaviour notes.
+"Test site switch" under Behaviour notes. The test Worker has no schedule: only production sends the reminders and cleans up the draws.
 
 ```powershell
 npm run db:migrate:remote   # after adding a migration
@@ -452,15 +462,16 @@ sanitized result; the web app runs an allowlist sanitizer with the same rules ag
 Two additions behind the web app's "highlight what the card got right" feature. Migration `0008_add_results_and_draws` is
 additive only (two new tables; no existing endpoint changes shape, `POST /render/numbers` gets one optional field). Migration
 `0009_add_personal_results` then lets members type results of their own ("Personal results" below): `GET /results` gets two
-more fields per row and the back office keeps listing the official results only.
+more fields per row and the back office keeps listing the official results only. Since the split the official results are written
+and listed by the **results API** (`numbergen-results-api`); this API reads them for the members.
 
 ### Lottery results
 
 The numbers of each draw: `3 ตัวบน` (`top3`, exactly 3 digits), `2 ตัวบน` (`top2`) and `2 ตัวล่าง` (`bottom2`, exactly 2
 digits). The **official** result of a **catalog** lottery is written by the results robot (a script holding `RESULTS_API_KEY`)
-or by an admin and seen by every member; a **personal** result is typed by one member for a lottery they can see, is seen by
-that member only and wins over the official one for them. The web app compares what a member reads with the numbers on a card.
-A member's own (custom) lotteries never have an official result.
+or by an admin, **through the results API** (`PUT /results`, see its README), and seen by every member here (`GET /results`); a **personal**
+result is typed by one member for a lottery they can see, is seen by that member only and wins over the official one for them. The
+web app compares what a member reads with the numbers on a card. A member's own (custom) lotteries never have an official result.
 
 **Data** (`lottery_results`): `id`, `lottery_id` (foreign key to `lotteries`), `draw_date` (Thai calendar day `YYYY-MM-DD`),
 `draw_time` (`HH:MM`, or `''` for a lottery that draws once a day, so the column is never NULL), `member_id` (`''` = official,
@@ -471,46 +482,23 @@ target (one row per draw and kind, however many writers race) and `(member_id, d
 result yet. Rows are never deleted automatically (at most a few hundred official ones a day); the admin lottery delete removes
 the lottery's results explicitly.
 
-| Endpoint | Auth | Request and response |
+| Endpoint | Where | Request and response |
 |---|---|---|
-| `PUT /results` | `X-API-Key: <RESULTS_API_KEY>` header **or** an admin session (`ng_admin` cookie) | body below; writes an **official** result; `201` when the draw had no official result yet, `200` when an earlier one was replaced; both answer the stored `AdminLotteryResult` |
-| `GET /results?date=YYYY-MM-DD` | member | `200 {date, results: MemberLotteryResult[]}`: what applies to this member, see "Personal results"; `400` without a real date |
-| `DELETE /results/:id` | admin only (the API key does not count) | `204`; `404 NOT_FOUND` for an unknown or already deleted id, and for the id of a personal result (the back office removes official results only) |
-| `GET /admin/results?date=YYYY-MM-DD` | admin | `200 {date, results: AdminLotteryResult[]}`: the **official** results only (every catalog lottery, switched off ones included); personal results are the members' private data and never listed |
-| `PUT /results/mine`, `DELETE /results/mine` | member | the member's own result, see "Personal results" |
+| `GET /results?date=YYYY-MM-DD` | **here**, member | `200 {date, results: MemberLotteryResult[]}`: what applies to this member, see "Personal results"; `400` without a real date |
+| `PUT /results/mine`, `DELETE /results/mine` | **here**, member | the member's own result, see "Personal results" |
+| `PUT /results`, `DELETE /results/:id`, `GET /admin/results?date=`, `POST /admin/results/import` | the **results API** | official results written and listed by the robot (`X-API-Key`) or the back office (admin token). **`404` on this API** |
 
 Shapes: `LotteryResult` = `{lotteryId, date, time, top3, top2, bottom2}` (`date` and `time` as stored; the three numbers are strings,
-so a leading zero survives, or `null`); `AdminLotteryResult` = `LotteryResult` plus `{id, source, createdAt, updatedAt}`;
-`MemberLotteryResult` = `LotteryResult` plus `{mine, official}` (see "Personal results").
-Lists are ordered by `lotteryId`, then `time` (`''` first, then `HH:MM` ascending).
+so a leading zero survives, or `null`); `MemberLotteryResult` = `LotteryResult` plus `{mine, official}` (see "Personal results"). The back
+office / robot shape `AdminLotteryResult` (plus `id`, `source`, timestamps) is the results API's. Lists are ordered by `lotteryId`, then `time`
+(`''` first, then `HH:MM` ascending).
 
-**`PUT /results` body** (a JSON object; any key other than these is `400`, so a typo cannot be dropped silently):
-
-| Field | Rule |
-|---|---|
-| `lotteryId` **or** `lotteryName` | exactly one (`null` counts as absent). The id of a catalog lottery, or its exact `name` (case-sensitive, whitespace around the request value ignored). Switched-off catalog lotteries are accepted. |
-| `date` | required, a real day written `YYYY-MM-DD` (the Thai date of the draw). |
-| `time` | optional: `HH:MM` (00:00-23:59, zero padded), or `""` / `null` / omitted for a lottery that draws once a day. |
-| `top3`, `top2`, `bottom2` | each optional (`null` = not given), but at least one is required. Strings of ASCII digits of the exact length (3, 2, 2), no trimming; a JSON number, `"12"` for `top3` or Thai digits are `400`. |
-| `source` | optional free text, trimmed, up to 200 characters; blank = none. |
-
-- **Replace semantics.** A `PUT` makes the stored draw exactly what was sent: a number that is left out (or `null`) is cleared,
-  `source` too; `id` and `createdAt` stay, `updatedAt` moves. To correct one number, send them all again.
-- **Errors**: `400 VALIDATION` (the message names the field), `401 UNAUTHENTICATED` (neither a valid key nor an admin session),
-  `403 FORBIDDEN` (a foreign `Origin`, see below), `404 LOTTERY_NOT_FOUND` (unknown id or name, or a member's own lottery),
-  `409 LOTTERY_AMBIGUOUS` (the name belongs to more than one catalog lottery: send `lotteryId`). The body is validated before
-  the lottery is looked up, and nothing is stored on any error.
-- **Key auth** (`src/middleware/resultsAuth.ts`). The header is `X-API-Key` (case-insensitive name); `Authorization` and query
-  strings are not read. The key is compared in constant time (`timingSafeEqualStr`) and the configured secret is trimmed first
-  (a newline that came with `secret put` is harmless). An unset, empty or blank `RESULTS_API_KEY` refuses every key, an empty
-  header included; an admin session still works then, so the endpoint is closed to robots, not to the back office. A wrong key
-  is `401`, the same as no key, and an admin cookie wins over a wrong key. There is no failed-attempt limiter on this path, so
-  use a long random key (32 random bytes). The robot is a server: it sends no `Origin` header (a request that carries a foreign
-  one is `403` from the CSRF guard, like every non-GET request), and `X-API-Key` is not in the CORS allow-list on purpose.
 - **Members** (`GET /results`) get the results of the date for the lotteries they can see (active catalog lotteries and their
   own; the same rule as `GET /lotteries`): the official results and their own, resolved as described in "Personal results",
   all draws of that date, no `id` / `source` / timestamps. A lottery with several draws on one date has several rows; the last
   one by `time` is the latest draw. There is no caching: a replaced or deleted result shows on the next request.
+- A member typing, replacing or removing their own result is **not** a change of the public results (the free site shows official
+  results only): nothing is recorded for the results API's publisher.
 
 ### Personal results (members type their own)
 
@@ -574,16 +562,18 @@ anything that says whose result it is included: the row is always the caller's o
   can name another one; unknown query parameters are ignored). `lotteryId` and `date` are required (`400`).
 - **The answers** `{date, lotteryId, results}` hold the rows `GET /results?date=` lists for that one lottery (empty list = no
   result), so the page can update its card at once: after a `DELETE` they are the official results again when no personal one is left.
-- **Back office and robot**: `PUT /results` always writes an official row (a `memberId` in its body is `400`), also when members
-  have personal results of the same draw; `DELETE /results/:id` and `GET /admin/results` only touch and list official rows.
+- **Back office and robot** (the results API): `PUT /results` always writes an official row (a `memberId` in its body is `400`), also when members
+  have personal results of the same draw; `DELETE /results/:id` and `GET /admin/results` only touch and list official rows. Its tests
+  (`test/officialAndPersonal.test.ts` there) cover that; here the members' side is tested.
 - **Cascades** (explicit in code): deleting a member (back office) deletes their personal results and every result of their own
-  lotteries; deleting an own lottery (member) deletes the results typed for it; deleting a catalog lottery (back office) deletes
-  its official results and every member's personal results of it.
+  lotteries; deleting an own lottery (member) deletes the results typed for it; deleting a catalog lottery (back office, `DELETE /admin/lotteries/:id`) deletes
+  its official results and every member's personal results of it (and records the change for the public site, see below).
 - **Not limited.** Like the official results, personal ones are never pruned and a member has no quota of them; the date only has
   to be a real day.
 - **Deploy order.** The unique index changed, so the code before 0009 cannot upsert official results once the migration ran
   (its `ON CONFLICT` target no longer exists) and this code needs the column: run `npm run deploy` (migrates, then deploys) and,
-  because the test Worker shares the database, `npm run deploy:test` right after.
+  because the test Worker shares the database, `npm run deploy:test` right after. (The results API needs the same migrations: deploy
+  this API's migrations first, see "Public results and the results API".)
 
 ### Saved draws (`member_draws`)
 
@@ -629,230 +619,60 @@ table) and **no index for the cleanup** (see below); the rows of a lottery are d
   after 14 days). A draw that a stale tab saves for a set in the very instant the set is being deleted can survive for up to 14
   days, never visible.
 
-## Public results snapshots (2026-11-21)
+## Public results and the results API (split, 2026-11-21)
 
-A free public site (the separate repo `numbergen-results`: no login, no cookies, nothing of the number generator) shows the
-**official** lottery results and per-lottery statistics. Its visitors never reach this API or D1: when official results change,
-this Worker rebuilds a few small JSON files in the R2 bucket `pnresult-public` (binding `PUBLIC_RESULTS`) and the site only
-reads those files. Migration `0010_add_public_results`; code in `src/lib/publicSnapshot.ts` (what is public and the file
-shapes, the pure state / statistics functions), `src/lib/publicChange.ts` (version counter, dirty marks, the atomic writes),
-`src/lib/publicPublish.ts` (the build, R2, the cron), `src/lib/resultsImport.ts`, `src/routes/adminPublic.ts` and
-`src/routes/publicData.ts`.
+The free public results site (the separate repo `numbergen-results`: static, no login, nothing of the number generator) shows the **official** lottery results and
+per-lottery statistics from small JSON files in the R2 bucket `pnresult-public`. The code that writes the official results, decides what is public, builds
+the files, publishes them (cron, versions, guards against an older build, statistics, the import, the local `GET /public-data/*`) is **not in this repo any more**:
+it is the **results API**, `../numbergen-results-api` (Worker `results-api`). Its README has the endpoint contract, the file shapes and the publishing rules.
+The database is shared; the schema is this repo's.
 
-### What is public (and what never is)
+| | numbergen-api (this repo) | numbergen-results-api |
+|---|---|---|
+| Members, cards, sets, assets, landing, push, draws, `GET /results`, `PUT` / `DELETE /results/mine` | **owns** | no |
+| Admin login (`ng_admin` cookie), `GET /admin/results-token` | **owns** | verifies the token it issues |
+| The lottery catalogue admin (`/admin/lotteries`) | **owns**; **records** a change in D1 and publishes nothing | publishes it from its cron |
+| Official results: `PUT /results`, `DELETE /results/:id`, `GET /admin/results`, `POST /admin/results/import` | no (**404**) | **owns** |
+| `/admin/public/*` (public switch, schedules, closed date, status, kill switch, publish), the snapshot files, the `PUBLIC_RESULTS` binding, `GET /public-data/*` | no (**404**, no binding) | **owns** |
+| **The database schema and its migrations** (`drizzle/`) | **owns, the only place** | describes the tables it uses and keeps a copy of the SQL (`npm run sync:schema`) |
 
-Only **official** results (`lottery_results.member_id = ''`) of **catalog** lotteries (`lotteries.owner_member_id IS NULL`) that are
-`active = 1` AND `public_enabled = 1` are ever read for a file. Every loader in `publicSnapshot.ts` is joined to `lotteries` with that
-one condition (`isPublicLottery`), and each file is built field by field (rows are never spread), so no row id, `source`, member id,
-reminder column or flag can get in; `assertWhitelisted` checks the finished file once more before it is uploaded. A member's typed
-result, a member's own lottery, a switched-off lottery and a lottery with `public_enabled = 0` are in no file (`test/publicPrivacy.test.ts`
-proves it, also with a deliberately weakened filter). A lottery that stops being public takes its `lottery/<id>.json` with it and its
-results leave `today.json` and every day file.
+### Recording a catalogue change (DB only)
 
-### The files
+An admin creating, renaming, switching off or deleting a catalog lottery can change what the public site shows. `POST` / `PATCH` / `DELETE /admin/lotteries` therefore **record** the
+change in D1, in the same batch as the change itself (`src/lib/publicChange.ts`, a minimal copy of the results API's `recordChangeStatements`): the counter `results_version` goes up by one and
+the dirty marks `results_dirty:l:<lottery id>` (its `lottery/<id>.json` file) and, when the lottery becomes public or hidden or is deleted, `results_dirty:d:<date>` for every date it has official results on.
+This API publishes nothing and **never calls the bucket** (there is no `PUBLIC_RESULTS` binding on the live or the test Worker, and the test Worker has no schedule); the results API's cron
+(every minute) builds and uploads the files, so a change reaches the public site within about a minute.
 
-Paths have no query string; dates are in the path. Every data file carries `v`, the version of the build that wrote it.
+What counts (decided here, in `routes/admin.ts`): only a real change of a lottery's name, short name, group, accent, sort order or `active`, of a lottery that is public before or after (`active` AND `public_enabled`);
+the reminder default (`notifyTime` / `notifyEnabled`), the same values again, a change of a lottery that is not public, and a member's own lotteries and results count nothing. The `public_enabled` switch itself is the results API's
+(`PATCH /admin/public/lotteries/:id`). The keys are a contract between the two Workers: `test/catalogueRecording.test.ts` pins the exact `site_settings` rows that a fixed sequence of changes leaves, and the results API's test of the
+same name pins the same rows for its own copy of the statements. None of these rows is in `SITE_SETTING_KEYS`, so `/admin/settings` does not change.
 
-| Path | Content |
-|---|---|
-| `v1/version.json` | `{ v, serverTime }`, written LAST by a build |
-| `v1/today.json` | every public lottery with its schedule and its results of Bangkok today and yesterday (as of the build) |
-| `v1/day/<YYYY-MM-DD>.json` | the results of one date (lotteries by id only; names are in `today.json`); `results: []` when there are none |
-| `v1/lottery/<id>.json` | one lottery: info, schedule, the last 90 draws, statistics for 30 / 60 / 90 draws |
+### `GET /admin/results-token`: the token for the results API
 
-The exact TypeScript types are the `Public*` interfaces at the top of `src/lib/publicSnapshot.ts`. A short example of each:
+The results API does not know the `ng_admin` cookie and uses no cookie of its own. The signed-in admin takes a short-lived token here and sends it there:
 
-```jsonc
-// v1/version.json
-{ "v": 42, "serverTime": "2026-11-20T11:31:05.120Z" }
-
-// v1/today.json (one lottery shown)
-{ "v": 42, "builtAt": "2026-11-20T11:31:05.120Z", "today": "2026-11-20", "yesterday": "2026-11-19",
-  "groups": [{ "key": "hanoi", "label": "ฮานอย" }, { "key": "lao", "label": "ลาว" }],
-  "lotteries": [{
-    "id": "hanoi-regular", "name": "ฮานอย ปกติ", "shortName": "ฮานอยปกติ", "group": "hanoi", "accent": "#be123c", "sortOrder": 10,
-    "schedules": [{ "drawTime": "", "resultTime": "18:30", "days": [1,2,3,4,5,6,7], "expectedFields": ["top3","top2","bottom2"], "closedDate": null }],
-    "results": [{ "date": "2026-11-20", "time": "", "top3": "465", "top2": "65", "bottom2": "18", "state": "final", "updatedAt": "2026-11-20T11:31:04.900Z" }]
-  }] }
-
-// v1/day/2026-11-20.json
-{ "v": 42, "builtAt": "2026-11-20T11:31:05.120Z", "date": "2026-11-20",
-  "results": [{ "lotteryId": "hanoi-regular", "date": "2026-11-20", "time": "", "top3": "465", "top2": "65", "bottom2": "18", "state": "final", "updatedAt": "2026-11-20T11:31:04.900Z" }] }
-
-// v1/lottery/hanoi-regular.json (stats is null below 30 final draws)
-{ "v": 42, "builtAt": "2026-11-20T11:31:05.120Z",
-  "lottery": { "id": "hanoi-regular", "name": "ฮานอย ปกติ", "shortName": "ฮานอยปกติ", "group": "hanoi", "accent": "#be123c", "sortOrder": 10 },
-  "schedules": [ /* as above */ ],
-  "draws": [{ "date": "2026-11-20", "time": "", "top3": "465", "top2": "65", "bottom2": "18", "state": "final" } /* newest first, at most 90 */],
-  "stats": [{ "draws": 30, "from": "2026-10-22", "to": "2026-11-20",
-    "top2": { "of": 30, "digitCounts": [3,6,6,6,6,3,6,6,6,6],
-              "topNumbers": [{ "n": "65", "count": 3 }],
-              "digitGaps": [{ "digit": 7, "gap": 7, "last": "2026-11-13" }],
-              "numberGaps": [{ "n": "97", "gap": 9, "last": "2026-11-11" }],
-              "even": 15, "odd": 15, "low": 15, "high": 15, "doubles": 6 },
-    "bottom2": { /* the same keys */ } } /* , the 60 and 90 windows when there are that many draws */] }
+```
+GET /admin/results-token                 needs the normal ng_admin admin session (cookie, credentials), nothing else
+  200 { "token": "<payload>.<signature>", "expiresAt": "2026-11-21T10:10:00.000Z" }     Cache-Control: no-store
+  401 UNAUTHENTICATED                    no / damaged / member session
+  503 RESULTS_TOKEN_NOT_CONFIGURED       RESULTS_ADMIN_SECRET is unset or shorter than 32 characters (checked after the session)
+  503 TESTSITE_OFF                       the test Worker with the test site switched off, like every route of that Worker
+then, on the results API:   Authorization: Bearer <token>      (no cookie, credentials omitted; CORS allows the origins of its WEB_URL)
 ```
 
-- `state` is `final` when every field of the schedule's `expectedFields` is present in the result (no schedule row for that draw time =
-  the default three fields), otherwise `partial`. Only the numbers decide; there are no timers.
-- `drawTime` of a schedule matches the `time` of its results (`''` for a lottery that draws once a day). `resultTime` is the Bangkok
-  time the result is expected ("ออกผลประมาณ ..."). `days` are ISO weekdays, 1 = Monday .. 7 = Sunday. `closedDate` = "no draw on this
-  date" (the site compares it with its own Bangkok date). The lists are in display order: `lotteries` by group (hanoi, lao, stock, thai,
-  other), `sortOrder`, name; `results` newest first.
-- `today.json` covers the Bangkok `today` and `yesterday` of the build. The window is computed from the clock of the build only to
-  choose the rows; which files are rebuilt never depends on the clock (see "What triggers a rebuild"). The cron rolls it over in the
-  first minute of every Bangkok day (below). Around midnight a client compares `today` with its own Bangkok date and picks rows by their
-  `date`, not by their position in the file.
-- Cache headers are stored on each object (`httpMetadata`), so an R2 custom domain serves them as they are: `version.json` `public,
-  max-age=5`, `today.json` `public, max-age=10`, day and lottery files `public, max-age=60`. Content type `application/json; charset=utf-8`.
+The token is `base64url(payload) "." base64url(HMAC-SHA256(secret, base64url(payload)))` with the payload `{"sub":"admin","iat":<s>,"exp":<s>}`, `exp = iat + 600` (10 minutes), signed with
+`RESULTS_ADMIN_SECRET`. The format is written once, in `src/lib/adminToken.ts`, **byte-for-byte the same file as `numbergen-results-api/src/lib/adminToken.ts`** (this repo signs, that one verifies);
+`test/adminToken.test.ts` is identical in both repos and pins the format with a fixed vector (a fixed secret and payload give exactly one token, computed with `node:crypto`), so changing the format in
+one repo fails both test suites until the other is changed too. A web client refreshes the token shortly before `expiresAt` or when the results API answers 401. The secret is trimmed on both sides.
+A token is no credential for this API: a bearer token never replaces the cookie on any route here.
 
-### Versions, order, and what the client does
+### Local run, deploy order, the shared secret
 
-- `results_version` (a `site_settings` row) is bumped by every change that can alter a public file and ONLY then. A build is stamped with the
-  version it read when it started; every file it writes carries that `v` (in the JSON and in the object's custom metadata `v`).
-- A build writes the data files first (the lottery and day files, then `today.json`) and `version.json` LAST. `today.json` is written by
-  **every** build, so its `v` always equals the `version.json` of the same build; day and lottery files are only written when they are
-  affected, so their `v` can be older than the current one while their content is current.
-- The client polls `version.json` (small, cached 5 s). When `v` moved it re-reads `today.json` and accepts it only when `file.v >= v` (else it
-  retries after 3 s, at most 5 times: the edge cache may still hold the old copy). The same rule only makes sense for a file the build
-  was known to rewrite, so for day and lottery files compare with the `v` of the copy you already hold (never replace a newer copy by an
-  older one) instead of the global version.
-- A slow older build never overwrites a newer one: an upload (`putMonotonic`) reads the object's `v` (HEAD), skips the file when it is newer,
-  and writes with an etag condition (`onlyIf`), repeating the check when another writer got in between. A removal (`removeMonotonic`) reads it
-  too and leaves a file that a newer build wrote.
-- The **lottery files** need more, because their absence means something (the lottery is not public) and an absent file has no version. A build that began
-  before a lottery was hidden could create its file again after the newer build had removed it (the whole history of a hidden lottery, public again), and a build
-  that began while it was hidden could delete the file that the newer build wrote when the lottery was shown again. So a build asks D1 which of its lotteries are
-  public (`loadPublicIds`) twice: just BEFORE it touches the lottery files (a job that no longer matches is put off and its mark stays) and just AFTER it. What turned
-  out wrong is marked again and counted as a new version in one batch, so the next pass, which reads D1 afresh, puts it right (the cron does not stay idle over it), and a file
-  that this build wrote for a lottery that is hidden or deleted by now is deleted at once. A page that this build deleted for a lottery that is public by now is missing until
-  that next pass (up to a minute). R2 has no conditional delete and no lock, so no check can close the window completely; the second look is what makes the end state right
-  whatever the interleaving, and it also runs when the writing fails halfway. Cost: two D1 statements per pass that has lottery files, none otherwise. Not covered: a build that is
-  killed (or whose second D1 read fails) between a stale write and that look; the file then stays until the lottery changes again or "rebuild everything" runs (it removes every
-  lottery file of a lottery that is not public).
-
-### What triggers a rebuild
-
-A rebuild is driven by the written row's `draw_date`, never by "now": a change marks `lottery/<id>.json` and `day/<its draw_date>.json`
-(`today.json` is always rewritten). It happens (in `ctx.waitUntil`, after the response) after `PUT /results`, `DELETE /results/:id`, the bulk
-import, and any change of a catalog lottery's name, short name, group, accent, sort order, `active`, `public_enabled` or schedule rows (also its
-creation and deletion), but only when something really changed:
-
-- A `PUT /results` with the numbers a draw already holds answers `200` with the stored row and changes **nothing**: no version bump, no marks,
-  `updated_at` stays (it is the "ออกแล้ว 18:31" mark), and its `source` is not stored either. It is one SQL statement (`ON CONFLICT DO UPDATE ...
-  WHERE numbers differ`), so racing writers cannot both count.
-- The change, the version bump and its marks are ONE D1 batch (all or nothing). The marks are `site_settings` rows `results_dirty:l:<id>`,
-  `results_dirty:d:<date>` (value = the version it was marked at). A build deletes only the marks it processed (same key and value), so a change that
-  arrives during a build keeps its marks, and moves `results_published_version` up in the same batch when no mark of that version or older is left.
-  A build that fails leaves its marks; the next one repeats the work.
-- A change to a lottery that is not public changes no file and counts nothing. A lottery that becomes public / hidden, is deleted, or whose schedule's
-  expected fields change also marks every date it has results on (their day files hold its results / its `state`).
-- **The cron** (`* * * * *`, `src/lib/publicPublish.ts`) reconciles: one read of `results_version` vs `results_published_version`; equal means stop (no
-  bucket call). Different means a bounded build. Without the `PUBLIC_RESULTS` binding it does nothing at all (not even the read).
-  With marks it handles them; with a newer version and NO mark (the first publish, or the data was edited by hand) it marks every public lottery and
-  the dates of the last 14 days. The first change after migration 0010 also does that (nothing was ever published, and there is no `version.json`), so a
-  single early write cannot stand in for the whole site. Migration 0010 seeds `results_version` = 1, so the first cron run after the binding exists
-  builds everything.
-- A build handles at most 4 marked files when a request starts it, 8 when the cron or the back office does (lotteries first, then dates newest first), plus
-  `today.json` and `version.json`: a large import leaves marks and the cron finishes them, a few files a minute.
-- At the start of every Bangkok day the cron bumps the version once and rewrites `today.json` (`results_rollover_day` remembers the day), so yesterday's
-  results move down and a result dated "tomorrow" (allowed, see below) moves up without anyone writing anything.
-
-### `PUT /results`: the date guard
-
-A draw date more than one day in the future (Bangkok) is `400 VALIDATION` for the robot and the admin alike (`date ล่วงหน้าได้ไม่เกิน 1 วัน (ไม่เกิน YYYY-MM-DD)`):
-tomorrow is allowed (a robot on another time zone is ahead of Bangkok for hours), anything later is a typo. It is checked before the lottery is looked up. A member's
-own result (`PUT /results/mine`) is not limited. The same limit applies to every row of the import.
-
-### Back office endpoints (admin cookie)
-
-| Endpoint | What |
-|---|---|
-| `GET /admin/public/lotteries` | every catalog lottery: `{id, name, shortName, group, accent, sortOrder, active, publicEnabled, schedules: [{drawTime, resultTime, days, expectedFields, closedDate}]}` |
-| `PATCH /admin/public/lotteries/:id` | `{publicEnabled}` the "แสดงบนเว็บผลหวย" switch; answers the lottery like the list |
-| `PUT /admin/public/lotteries/:id/schedules` | `{drawTime, resultTime, days, expectedFields}` creates (`201`) or replaces (`200`) one draw time; every field required, unknown keys `400`; the closed date is kept; `409 QUOTA` after 24 rows |
-| `DELETE /admin/public/lotteries/:id/schedules?drawTime=` | `204`; `drawTime` is required (an empty value names the row of a once-a-day lottery); `404` when there is no such row |
-| `PUT /admin/public/lotteries/:id/schedules/closed` | `{drawTime, closedDate: "YYYY-MM-DD" \| null}` the "วันนี้งดออกผล" switch of a row that exists |
-| `GET /admin/public/status` | `{enabled, bucketBound, version, publishedVersion, pending}` |
-| `PUT /admin/public/enabled` | `{enabled}` the kill switch `public_results_enabled` (default on) |
-| `POST /admin/public/publish` | `{rebuild?, allDays?, passes?}` (the body may be empty) runs ONE bounded pass now; `rebuild` first marks everything (every public lottery, the last 14 days of dates, `allDays` = all dates, and the files of lotteries that are not public, to be removed) and counts a version. Call it again while `pending` is above 0, or give `passes` (1-30) to run several in one call: only a local `wrangler dev` can afford that, a Workers Free request makes about 41 calls per pass of its 50 |
-| `POST /admin/results/import` | the bulk import below |
-
-Schedule rules: `drawTime` `""` or `HH:MM`; `resultTime` `HH:MM`; `days` a non-empty list of distinct integers 1-7; `expectedFields` a non-empty list of distinct
-`top3` / `top2` / `bottom2` (stored and returned in that order); only the admin of a **catalog** lottery (a member's own lottery or an unknown id is `404`). A lottery
-that publishes fewer than three numbers needs a row with the right `expectedFields`, otherwise its draws stay `partial` forever (and, being not final, give no statistics).
-
-### Bulk import of old official results
-
-`POST /admin/results/import` with `{ "csv": "<pasted text>", "dryRun": true }` or `{ "rows": [{ "lottery", "date", "time"?, "top3"?, "top2"?, "bottom2"? }], "dryRun"? }` (exactly one of
-`csv` / `rows`; at most 2000 rows, the 2001st makes the call a `400`; the body at most 768 KB). A pasted line is `lottery,date,time,top3,top2,bottom2`: the lottery by id or by its exact
-name (a member's own lottery is "not found"), `time` and the numbers may be empty (at least one number), comma / semicolon / tab separated, "quoted" cells, a header line whose second cell is
-`date` / `วันที่` is skipped. Rules per row: a real `YYYY-MM-DD` not earlier than 2000-01-01 and not later than tomorrow (Bangkok), `HH:MM` or no time, exactly 3 / 2 / 2 ASCII digits, a draw only once per call.
-
-The answer is the same for the preview and the real run: `{ dryRun, saved, summary: {total, new, changed, same, errors}, rows: [{ line, status, lotteryId, lotteryName, date, time, top3, top2, bottom2, previous, error }] }`
-(`status` is `new`, `changed` with `previous` = the numbers it replaces, `same` or `error` with a Thai reason; `line` is the line of the pasted text). A row error never fails the call. With `dryRun`
-nothing is written. Otherwise every `new` and `changed` row is saved (replace semantics, `source` = `นำเข้า`) in ONE atomic D1 batch of a handful of statements (the rows travel as JSON, 500 per
-statement, so neither D1's 100 parameters nor its 50 statements get in the way), together with ONE version bump and the marks of the dates and lotteries it touched; `same` rows write nothing.
-Importing the same text twice therefore changes nothing the second time. The files are rebuilt afterwards, a few per pass (the cron continues; locally call `POST /admin/public/publish` until `pending` is 0).
-
-### Statistics
-
-Per lottery, from the **final** draws of the official results only, newest first, for the last 30, 60 and 90 draws; `stats` is `null` below 30 final draws (the page shows the history alone) and a window
-is present only when there are that many final draws. A draw counts once (several draws a day count each). For each of `top2` and `bottom2`, over the draws of the window that have the number:
-`digitCounts[d]` = the number of draws in which digit d appears (`55` counts 5 once); `topNumbers` = the most frequent two-digit numbers (at most 10; equal counts: the one seen more recently first, then the smaller number);
-`digitGaps` = all ten digits, longest absent first, with the gap in draws since it last appeared (0 = in the newest draw) and that draw's date (a digit not in the window: `gap` = `of`, `last` = null);
-`numberGaps` = the numbers seen in the window that have been absent longest (at most 10); `even`/`odd`, `low` (00-49)/`high` (50-99) and `doubles` (เลขเบิ้ล: 00, 11 ... 99) as counts of the `of` draws.
-Wording on the site stays factual ("สถิติย้อนหลัง ไม่ใช่การทำนาย"). The `draws` list shows the last 90 draws of any state (each with its `state`); the 90 draws the statistics need are read from the newest 120.
-
-### Kill switch, the test Worker and its hazard
-
-`site_settings` key `public_results_enabled` (`"true"` / `"false"`, default on; only the exact text `"false"` means off; `PUT /admin/public/enabled`). Off = nothing is published: writes still bump
-the version and mark files, so switching it on again catches up (the switch itself starts a build). It does not unpublish what is already in the bucket.
-
-The **test Worker has no `PUBLIC_RESULTS` binding** (`[env.test]` in `wrangler.toml`), so it never uploads. But it shares D1 with the live Worker: a result written through the test Worker bumps
-`results_version` in the shared `site_settings`, and **the live Worker's cron publishes it** to the public site within a minute. Writes through the test Worker are not restricted (test results of
-a public lottery become public!); before testing with made-up results either use a lottery with `public_enabled = 0` or switch `public_results_enabled` off, and remove the test rows (`DELETE /results/:id`) before switching it on.
-
-### Deploying and operating
-
-1. Create the bucket once: `npx wrangler r2 bucket create pnresult-public`. `npm run deploy` migrates D1 first (adds `0010`), then deploys the Worker with the binding.
-2. Serve the bucket on an **R2 custom domain** (Cloudflare dashboard, R2, `pnresult-public`, Settings, Custom Domains; e.g. `data.<the results site's domain>`, the zone must be on the same account). Leave the
-   `r2.dev` URL off. The site reads `https://<that domain>/v1/today.json` and so on: ONE base URL constant in the site, the paths after it never change.
-3. A Cache Rule for that hostname (cache eligibility: eligible; edge TTL: use the origin `Cache-Control`) so that the CDN, not R2, answers the visitors (JSON is not cached by default). The short TTLs above are what the
-   client's "chase the version" rule needs. If the site and the files are on different origins, add a CORS policy to the bucket (`AllowedOrigins` the site, `AllowedMethods` GET and HEAD, `AllowedHeaders` `*`).
-4. The first build needs no action: migration 0010 seeds `results_version`, so the first cron run after the binding exists builds every file (a few a minute: about 11 runs for the 82 lotteries). To force one:
-   `POST /admin/public/publish {"rebuild": true}` (add `"allDays": true` to rebuild the day file of every date), then call it again while `pending` is above 0.
-5. Levers: the status (`GET /admin/public/status`), the kill switch, `rebuild`, and bumping `results_version` by hand (`UPDATE site_settings SET value = CAST(value AS INTEGER) + 1 WHERE key = 'results_version'`: a version
-   without marks makes the cron mark everything). After restoring D1 from a backup, set `results_version` above the highest `v` in the bucket: a file that holds a newer
-   version is never overwritten or removed by a build with an older one.
-6. Free plan: a Worker invocation may make 50 D1 statements and 50 subrequests. Measured (`test/publicBudget.test.ts`): an idle cron run is 1 statement and 0 bucket calls; a robot result with its background build is
-   about 17 statements and 8 bucket calls; a full cron pass of 8 files 20 statements and 21 bucket calls; a 2000 row import with its build 25 statements and 13 bucket calls.
-
-### Local development: how the new site reads the files
-
-`npm run dev` serves **`GET /public-data/<path>`** on the API Worker (`http://localhost:8787/public-data/v1/today.json`, `.../v1/version.json`, `.../v1/day/2026-11-20.json`, `.../v1/lottery/hanoi-regular.json`): it streams the
-file out of the (locally simulated) `PUBLIC_RESULTS` bucket with the content type and `Cache-Control` the object was stored with, an `ETag` (`If-None-Match` gets a `304`) and `Access-Control-Allow-Origin: *`, no cookie, no login.
-It exists **only while `COOKIE_SECURE` is not `"true"`** (the `.dev.vars` of local development say `false`; the live and the test Worker say `true`, where it is a plain 404), and it answers only the four file shapes. So:
-
-- local: the site's data base URL is `http://localhost:8787/public-data/`;
-- production: the base URL is the R2 custom domain, `https://<domain>/`;
-- everything after the base (`v1/today.json` ...) is identical, so the site needs one constant (for example `VITE_DATA_BASE`) and nothing else.
-
-To have files locally: `npm run db:migrate` (applies 0010 to the local D1), `npm run seed`, `npm run dev`, sign in to the back office (or `curl` the login), then publish once:
-
-```powershell
-# the cookie jar is a plain file; admin / admin1234 are the local back office login (see "Setup")
-curl.exe -c jar.txt -H "Content-Type: application/json" -d '{\"username\":\"admin\",\"password\":\"admin1234\"}' http://localhost:8787/admin/login
-curl.exe -b jar.txt -H "Content-Type: application/json" -d '{\"rebuild\":true,\"passes\":30}' http://localhost:8787/admin/public/publish   # one call builds all 82 lotteries
-curl.exe http://localhost:8787/public-data/v1/today.json
-```
-
-Every later `PUT /results`, import or back office change republishes in the background of the request. `wrangler dev` runs no cron; add `--test-scheduled` and `curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"`
-runs the reconcile once, like a cron minute.
-
-### Tests
-
-`test/publicSnapshot.test.ts` (pure functions: state, statistics on hand-checked fixtures, the under-30 rule, a naive cross-check, today's Bangkok window, the whitelist), `test/publicPublish.test.ts` (the pipeline with a fake bucket: version and
-write order, the "really changed" rule, the guard against an older build (also for the lottery files: both directions of the race replayed with hooks in the fake bucket, and seeded random interleavings), the first publish, the cron reconcile, the kill switch, no binding), `test/publicPrivacy.test.ts` (what is never public, exact keys of every file, files that
-must disappear, Bangkok midnight, the daily roll-over), `test/publicAdmin.test.ts` (migration 0010, the admin endpoints, schedule validation, the import, the date guard, the local route), `test/publicBudget.test.ts` (statements and bucket calls per
-invocation). They use real libSQL files (`test-public-*.db`) and `test/helpers/fakeR2.ts` / `publicHarness.ts`.
+- **Local** (three terminals): this API `npm run dev` on 8787; the results API `npm run dev:shared` on 8788 (it uses this repo's `.wrangler/state`, so both see ONE local D1; `npm run db:migrate` and `npm run seed` here once);
+  the results site `$env:VITE_DATA_URL = 'http://localhost:8788/public-data/'; npm run dev`. Both `.dev.vars` need the same `RESULTS_ADMIN_SECRET`. After a migration here: `npm run sync:schema` in the results API.
+- **Deploy order**: (1) this API's migrations (`npm run db:migrate:remote`, a no-op when applied), (2) the results API with its secrets (`RESULTS_API_KEY` = the robot's key, `RESULTS_ADMIN_SECRET`), (3) point the results robot at the results API,
+  (4) set `RESULTS_ADMIN_SECRET` here (`npx wrangler secret put RESULTS_ADMIN_SECRET`, and `--env test`), then `npm run deploy` and `npm run deploy:test` (this removes the moved routes, the `PUBLIC_RESULTS` bindings and the test schedule) **together with
+  the web app** (its results pages call the results API with the token; until then the old pages get 404), (5) `npx wrangler secret delete RESULTS_API_KEY` here (and `--env test`). The step-by-step text is in the README of the results API.
+- **A schema change** for a table the results API uses is made here first (`src/db/schema.ts`, `npm run db:generate`, `npm run db:migrate:remote`), then `npm run sync:schema` in the results API and its `src/db/schema.ts` if the table or column it uses changed (its `schemaSync` test fails when they drift).

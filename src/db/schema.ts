@@ -59,7 +59,8 @@ export const lotteries = sqliteTable(
     /**
      * The "แสดงบนเว็บผลหวย" switch: whether the free public results site shows this catalog lottery.
      * Only a catalog lottery (owner_member_id IS NULL) that is `active` AND `publicEnabled` is ever
-     * published (src/lib/publicSnapshot.ts); a member's own lottery never is, whatever this says.
+     * published (by the results API, numbergen-results-api src/lib/publicSnapshot.ts); a member's own lottery never
+     * is, whatever this says.
      */
     publicEnabled: integer('public_enabled', { mode: 'boolean' }).notNull().default(true),
   },
@@ -319,8 +320,8 @@ export const landingItems = sqliteTable(
 
 /**
  * The result of one draw, in two kinds told apart by `memberId`:
- *   - OFFICIAL (memberId ''): entered by the back office or the results robot (PUT /results), for
- *     a catalog lottery (owner_member_id IS NULL), read by every member (GET /results).
+ *   - OFFICIAL (memberId ''): entered by the back office or the results robot (PUT /results of the results API,
+ *     numbergen-results-api), for a catalog lottery (owner_member_id IS NULL), read by every member (GET /results).
  *   - PERSONAL (memberId = a member): typed by that member (PUT /results/mine) for any lottery they
  *     can see, an active catalog lottery or one of their own. Only that member ever reads it, and
  *     for them it hides the official result of the same lottery and date; the back office never
@@ -360,7 +361,7 @@ export const lotteryResults = sqliteTable(
     // The upsert target of PUT /results and PUT /results/mine: one result per draw and kind.
     uniqueIndex('lottery_results_draw_unique_idx').on(t.lotteryId, t.drawDate, t.drawTime, t.memberId),
     // Serves GET /results?date= (the official rows and the member's own: member_id IN ('', me)),
-    // GET /admin/results?date= (member_id = '') and the delete of a member's personal rows.
+    // GET /admin/results?date= of the results API (member_id = '') and the delete of a member's personal rows.
     index('lottery_results_member_date_idx').on(t.memberId, t.drawDate),
     // Serves "the official rows of one lottery, newest first" (the public results snapshot, the
     // import's lookup of existing rows, the dates a lottery has results on) without reading or

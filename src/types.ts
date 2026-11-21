@@ -329,8 +329,8 @@ export interface AdminLanding {
  * The numbers of one draw of a lottery. `top3` is 3 ตัวบน (exactly 3 digits), `top2` 2 ตัวบน and
  * `bottom2` 2 ตัวล่าง (exactly 2 digits), each `null` while that number is not known; at least one
  * is set. The numbers are strings, so leading zeros survive ("05"). This is the OFFICIAL result of
- * a catalog lottery (what the back office and the results robot write); members read it inside a
- * {@link MemberLotteryResult}.
+ * a catalog lottery (what the back office and the results robot write, through the results API,
+ * numbergen-results-api); members read it inside a {@link MemberLotteryResult}.
  */
 export interface LotteryResult {
   lotteryId: string
@@ -341,18 +341,6 @@ export interface LotteryResult {
   top3: string | null
   top2: string | null
   bottom2: string | null
-}
-
-/**
- * A result as the back office (and the results robot) sees it: `PUT /results` and
- * `GET /admin/results`, official results only. `id` is what `DELETE /results/:id` takes; `source`
- * is the free text the writer sent (members never see it).
- */
-export interface AdminLotteryResult extends LotteryResult {
-  id: string
-  source: string | null
-  createdAt: string
-  updatedAt: string
 }
 
 /**
@@ -397,90 +385,6 @@ export interface MemberDraw {
   updatedAt: string
 }
 
-/** The three numbers of a draw as field names: 3 ตัวบน, 2 ตัวบน, 2 ตัวล่าง (the columns of lottery_results). */
-export type ResultField = 'top3' | 'top2' | 'bottom2'
-/** In the order they are stored and listed: expected_fields is always written in this order. */
-export const RESULT_FIELDS = ['top3', 'top2', 'bottom2'] as const satisfies readonly ResultField[]
-
-/**
- * One draw time of a catalog lottery as the back office sees it (the shape of lottery_schedules; the
- * public snapshot files carry the same fields). `drawTime` is '' or "HH:MM" and matches the `time` of
- * the results; `resultTime` is the "HH:MM" (Asia/Bangkok) the result is expected at; `days` are the
- * weekdays it draws, 1 = Monday .. 7 = Sunday; `expectedFields` are the numbers the draw publishes (a
- * result that has all of them is final); `closedDate` (YYYY-MM-DD) means "no draw on that date".
- */
-export interface AdminSchedule {
-  drawTime: string
-  resultTime: string
-  days: number[]
-  expectedFields: ResultField[]
-  closedDate: string | null
-}
-
-/**
- * A catalog lottery with its public-site settings (`GET /admin/public/lotteries`). Only a lottery that
- * is `active` AND `publicEnabled` is published; `schedules` are ordered by `drawTime` ('' first).
- */
-export interface AdminPublicLottery {
-  id: string
-  name: string
-  shortName: string
-  group: Group
-  accent: string
-  sortOrder: number
-  active: boolean
-  publicEnabled: boolean
-  schedules: AdminSchedule[]
-}
-
-/**
- * State of the public snapshots (`GET /admin/public/status`). `enabled` is the site_settings switch
- * public_results_enabled (default true; false stops all publishing), `bucketBound` whether this Worker
- * has the PUBLIC_RESULTS binding (the test Worker has none), `version` the counter bumped by every
- * change of the official results, `publishedVersion` the last version fully published (equal = nothing
- * waits), `pending` the number of files still marked for a rebuild.
- */
-export interface PublicStatus {
-  enabled: boolean
-  bucketBound: boolean
-  version: number
-  publishedVersion: number
-  pending: number
-}
-
-/** Outcome of one row of `POST /admin/results/import` (the same shape for the preview and the real run). */
-export type ImportRowStatus = 'new' | 'changed' | 'same' | 'error'
-
-export interface ImportRowReport {
-  /** 1-based line of the pasted text (or position in `rows`) this row came from. */
-  line: number
-  status: ImportRowStatus
-  /** Resolved catalog lottery, null when the row names none (or an unknown / ambiguous one). */
-  lotteryId: string | null
-  lotteryName: string | null
-  /** As read; null when the row has no usable date. */
-  date: string | null
-  time: string
-  top3: string | null
-  top2: string | null
-  bottom2: string | null
-  /** The numbers a 'changed' row replaces; null otherwise. */
-  previous: { top3: string | null; top2: string | null; bottom2: string | null } | null
-  /** Why a row is refused (status 'error'); null otherwise. */
-  error: string | null
-}
-
-/**
- * Answer of `POST /admin/results/import`. With `dryRun` nothing is written and `saved` is 0; otherwise
- * every 'new' and 'changed' row is saved (the 'error' rows are skipped) and `saved` is their number.
- */
-export interface ImportReport {
-  dryRun: boolean
-  saved: number
-  summary: { total: number; new: number; changed: number; same: number; errors: number }
-  rows: ImportRowReport[]
-}
-
 export interface ApiErrorBody {
   error: { code: string; message: string }
 }
@@ -500,40 +404,6 @@ export interface AssetBucket {
   delete(keys: string | string[]): Promise<void>
   /** Optional so the Node tests' fake bucket can omit it; the R2 binding always has it. */
   list?(opts: { prefix: string; cursor?: string; limit?: number }): Promise<{
-    objects: { key: string }[]
-    truncated: boolean
-    cursor?: string
-  }>
-}
-
-/**
- * What the public snapshot publisher needs from the PUBLIC_RESULTS R2 bucket (a subset of the R2Bucket
- * binding, so tests can pass a fake). `put` with `onlyIf` answers null when the condition fails.
- */
-export interface PublicBucketHead {
-  key: string
-  etag: string
-  httpMetadata?: { contentType?: string; cacheControl?: string }
-  customMetadata?: Record<string, string>
-}
-export interface PublicBucketObject extends PublicBucketHead {
-  body: ReadableStream
-  size: number
-}
-export interface PublicBucket {
-  put(
-    key: string,
-    value: string,
-    options?: {
-      httpMetadata?: { contentType?: string; cacheControl?: string }
-      customMetadata?: Record<string, string>
-      onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string }
-    },
-  ): Promise<unknown>
-  get(key: string): Promise<PublicBucketObject | null>
-  head(key: string): Promise<PublicBucketHead | null>
-  delete(keys: string | string[]): Promise<void>
-  list(opts: { prefix: string; cursor?: string; limit?: number }): Promise<{
     objects: { key: string }[]
     truncated: boolean
     cursor?: string
@@ -560,13 +430,6 @@ export interface Bindings {
   TEST_STACK?: string
   ASSETS: AssetBucket
   /**
-   * R2 bucket `pnresult-public` that the free public results site reads: the snapshot files of the
-   * official results (src/lib/publicSnapshot.ts, src/lib/publicPublish.ts). Optional: a Worker without
-   * it (the test Worker, the Node tests) publishes nothing and does not fail. Never holds anything but
-   * public data.
-   */
-  PUBLIC_RESULTS?: PublicBucket
-  /**
    * Web Push (VAPID) keys, base64url: the 65 byte public point and the 32 byte private scalar
    * (`npm run vapid:generate`). Without both, GET /push/key answers 503 and the cron does nothing.
    */
@@ -575,11 +438,11 @@ export interface Bindings {
   /** `mailto:` or `https:` contact for the VAPID `sub` claim. Default https://pnphoto.co. */
   VAPID_SUBJECT?: string
   /**
-   * Secret for the results robot: `PUT /results` accepts it in the `X-API-Key` header (compared in
-   * constant time) as an alternative to a signed-in admin. Unset or blank = the key path refuses
-   * every key and only an admin can write results (src/middleware/resultsAuth.ts).
+   * The secret shared with the results API (numbergen-results-api) that signs the 10 minute admin tokens of
+   * GET /admin/results-token (src/lib/adminToken.ts), at least 32 characters. Unset or too short = that endpoint
+   * answers 503 RESULTS_TOKEN_NOT_CONFIGURED. The test Worker needs its own copy (secrets are per Worker).
    */
-  RESULTS_API_KEY?: string
+  RESULTS_ADMIN_SECRET?: string
 }
 
 export interface MemberRow {
@@ -649,12 +512,6 @@ export const DRAW_RETENTION_DAYS = 14
 export const MAX_DRAW_SCOPES = 50
 /** Largest JSON body accepted by PUT /results/mine (bytes; a real one is under 150). */
 export const MAX_MY_RESULT_BODY_BYTES = 1024
-/** Rows one POST /admin/results/import call accepts (the 2001st row makes the whole call a 400). */
-export const MAX_IMPORT_ROWS = 2000
-/** Largest JSON body accepted by POST /admin/results/import (bytes; 2000 rows are about 150 KB). */
-export const MAX_IMPORT_BODY_BYTES = 768 * 1024
-/** Schedule rows (draw times) one catalog lottery may have; the 25th is a 409 QUOTA. */
-export const MAX_SCHEDULES_PER_LOTTERY = 24
 export const MIN_ROUND = 1
 export const MAX_ROUND = 20
 export const MAX_ASSET_BYTES = 5 * 1024 * 1024

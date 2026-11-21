@@ -14,7 +14,7 @@ type LotteryRow = typeof lotteries.$inferSelect
  * Maps a lottery row to the API shape. Pass the requesting `memberId` to set `custom: true`
  * when the lottery is owned by that member. Admin / public callers omit the id and get
  * `custom: false`. The reminder columns and the public-site switch are not part of the member shape
- * (see toAdminLottery, and GET /admin/public/lotteries for the switch).
+ * (see toAdminLottery; the switch is the results API's GET /admin/public/lotteries).
  */
 export function toLottery(
   r: Omit<LotteryRow, 'notifyTime' | 'notifyEnabled' | 'publicEnabled'>,

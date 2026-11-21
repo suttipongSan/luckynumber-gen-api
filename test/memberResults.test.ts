@@ -3,15 +3,16 @@
 // from GET /results (their own wins over the official one of the lottery and date and the official
 // one applies again after a delete), isolation between members, the back office and the robot never
 // listing, deleting or being blocked by a personal result, and the cascades of a deleted member or
-// lottery. Real libSQL file DB with the project's migrations. The official results themselves
-// (PUT /results, GET /admin/results, DELETE /results/:id) and migration 0009 are in results.test.ts.
+// lottery. Real libSQL file DB with the project's migrations. The official results are written by the results API
+// (numbergen-results-api: PUT /results, GET /admin/results, DELETE /results/:id; its tests cover the back office and
+// the robot next to personal results), so here an official result is a row that is simply there (`putOfficial`).
+// Migration 0009 is in results.test.ts.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, rmSync } from 'node:fs'
 import { eq, sql } from 'drizzle-orm'
 import app from '../src/index'
 import type {
   AdminLottery,
-  AdminLotteryResult,
   AdminMember,
   AssetBucket,
   Bindings,
@@ -26,6 +27,7 @@ import { openDb, runMigrations } from '../scripts/db'
 import { LOTTERY_CATALOG } from '../src/db/catalog'
 import { lotteries, lotteryResults } from '../src/db/schema'
 import { requireVisibleLottery, resolveForMember, type ResultRow } from '../src/lib/results'
+import { putOfficialResult, type OfficialResult, type OfficialResultInput } from './helpers/officialResult'
 
 // Everything in lib/results is the real code; the wrapper only lets one test make the visibility
 // check pass for a lottery that is gone by the time of the write (see "between the check and the write").
@@ -36,6 +38,7 @@ vi.mock('../src/lib/results', async (importOriginal) => {
 
 const DB_FILE = 'test-memberresults.db'
 const DB_URL = `file:${DB_FILE}`
+// the key of the results robot: not a credential of this API any more (see "members only")
 const KEY = 'test-memberresults-key-0123456789abcdef0123456789abcdef'
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
 const D = '2026-11-19'
@@ -90,8 +93,12 @@ const putMine = (cookie: string | undefined, body: unknown, o: CallOpts = {}) =>
 /** DELETE /results/mine?... as `cookie`. */
 const delMine = (cookie: string | undefined, params: Record<string, string>, o: CallOpts = {}) =>
   call('DELETE', `/results/mine?${new URLSearchParams(params)}`, { ...o, cookie })
-/** PUT /results: the official result, by the robot key unless told otherwise. */
-const putOfficial = (body: unknown, o: CallOpts = { key: KEY }) => call('PUT', '/results', { ...o, body })
+/**
+ * An official result as the results API (numbergen-results-api, PUT /results) stores it: the row is written directly with
+ * the same replace semantics (test/helpers/officialResult.ts); the answer is the stored row, 201 when it was new, 200 when
+ * it replaced one. The route itself is tested in that repo; here only what members read of the row matters.
+ */
+const putOfficial = (body: OfficialResultInput) => putOfficialResult(getDb(env), body)
 
 function cookieFrom(res: Response, name: string): string {
   const raw = res.headers.get('set-cookie') ?? ''
@@ -176,7 +183,6 @@ beforeAll(async () => {
     WEB_URL: 'http://localhost:5173',
     COOKIE_SECURE: 'false',
     ASSETS: fakeBucket,
-    RESULTS_API_KEY: KEY,
   }
   admin = await adminCookie()
   alice = await newMember('alice')
@@ -389,6 +395,10 @@ describe('PUT /results/mine: validation', () => {
     expect(await allRows()).toHaveLength(0)
   })
 
+  it('a date far in the future is fine: the one-day limit is the official result\'s (results API), not a member\'s own', async () => {
+    expect((await putMine(alice.cookie, { lotteryId: 'hanoi-regular', date: '2030-01-01', top3: '123' })).status).toBe(201)
+  })
+
   it('accepts a real leap day', async () => {
     expect((await putMine(alice.cookie, { ...good, date: '2028-02-29' })).status).toBe(201)
   })
@@ -589,15 +599,25 @@ describe('PUT / DELETE /results/mine: members only', () => {
     expect(await allRows()).toHaveLength(0)
   })
 
-  it('"mine" is never read as the id of DELETE /results/:id (that one is the back office)', async () => {
-    // if the admin route caught it, an admin cookie would get 404 NOT_FOUND from there
+  it('the official routes live in the results API: PUT /results and DELETE /results/<id> are 404 here, whoever asks; DELETE /results/mine is still the member route', async () => {
+    const official = (await (await putOfficial(body)).json()) as OfficialResult
+    for (const o of [{}, { cookie: admin }, { cookie: alice.cookie }, { key: KEY }, { cookie: admin, key: KEY }]) {
+      const put = await call('PUT', '/results', { ...o, body })
+      expect(put.status, JSON.stringify(o)).toBe(404)
+      expect(await put.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
+      const del = await call('DELETE', `/results/${official.id}`, o)
+      expect(del.status, JSON.stringify(o)).toBe(404)
+    }
+    expect(await rowsOf('')).toMatchObject([{ id: official.id }]) // nothing was written or deleted
+    // "mine" is the member's, as before: without a session it is 401 (the admin cookie does not make it an admin route)
     const res = await call('DELETE', '/results/mine', { cookie: admin })
     expect(res.status).toBe(401)
     expect(await res.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED' } })
-    // and the other way round: an id still reaches the admin route
-    const official = (await (await putOfficial(body)).json()) as AdminLotteryResult
-    expect((await call('DELETE', `/results/${official.id}`, { cookie: admin })).status).toBe(204)
-    expect((await call('DELETE', `/results/${official.id}`, { cookie: alice.cookie })).status).toBe(401)
+    // and the admin list and import are 404 here too (the admin session is no help: they are another Worker's)
+    expect((await call('GET', `/admin/results?date=${D}`, { cookie: admin })).status).toBe(404)
+    expect((await call('POST', '/admin/results/import', { cookie: admin, body: { csv: 'x' } })).status).toBe(404)
+    expect((await call('GET', '/admin/public/status', { cookie: admin })).status).toBe(404)
+    expect((await call('GET', '/public-data/v1/today.json')).status).toBe(404)
   })
 
   it('a disabled or expired member gets 403', async () => {
@@ -630,14 +650,6 @@ describe('PUT / DELETE /results/mine: members only', () => {
     expect(await allRows()).toHaveLength(0)
   })
 
-  it('PUT /results (robot key or admin) cannot write a personal result: a member id is refused', async () => {
-    for (const o of [{ key: KEY }, { cookie: admin }]) {
-      const res = await putOfficial({ ...body, memberId: alice.id }, o)
-      expect(res.status).toBe(400)
-      expect(((await res.json()) as { error: { message: string } }).error.message).toContain('memberId')
-    }
-    expect(await allRows()).toHaveLength(0)
-  })
 })
 
 // ---- DELETE /results/mine ------------------------------------------------------------------------
@@ -761,7 +773,7 @@ describe('GET /results: the own result wins over the official one', () => {
   })
 
   it('removing it falls back to the official result, which was never touched', async () => {
-    const official = (await (await putOfficial({ ...draw, ...officialNumbers })).json()) as AdminLotteryResult
+    const official = (await (await putOfficial({ ...draw, ...officialNumbers })).json()) as OfficialResult
     await putMine(alice.cookie, { ...draw, top3: '999' })
     const res = await delMine(alice.cookie, draw)
     expect(((await res.json()) as MemberLotteryResultsOfDay).results).toEqual([row('hanoi-regular', '', officialNumbers, false)])
@@ -909,7 +921,7 @@ describe('isolation between members', () => {
   })
 
   it('a member can never write or delete an official row', async () => {
-    const official = (await (await putOfficial({ ...draw, top3: '111' })).json()) as AdminLotteryResult
+    const official = (await (await putOfficial({ ...draw, top3: '111' })).json()) as OfficialResult
     // writing the same draw makes a row of the member, the official row is not replaced
     const res = await putMine(alice.cookie, { ...draw, top3: '999' })
     expect(res.status).toBe(201)
@@ -922,76 +934,9 @@ describe('isolation between members', () => {
       { lotteryId: 'hanoi-regular', date: D, time: '', top3: '111', top2: null, bottom2: null, mine: false, official: null },
     ])
     expect(await rowsOf('')).toMatchObject([{ id: official.id, top3: '111' }])
-    // the id of the official row is no way in either
-    expect((await call('DELETE', `/results/${official.id}`, { cookie: alice.cookie })).status).toBe(401)
+    // the id of the official row is no way in either (the route is not even here)
+    expect((await call('DELETE', `/results/${official.id}`, { cookie: alice.cookie })).status).toBe(404)
     expect(await rowsOf('')).toHaveLength(1)
-  })
-})
-
-// ---- the back office and the robot ---------------------------------------------------------------
-
-describe('the back office and the robot next to personal results', () => {
-  const draw = { lotteryId: 'hanoi-regular', date: D }
-
-  it('GET /admin/results lists the official results only', async () => {
-    const official = (await (await putOfficial({ ...draw, top3: '111' })).json()) as AdminLotteryResult
-    await putMine(alice.cookie, { ...draw, top3: '222' })
-    await putMine(bob.cookie, { ...draw, time: '09:00', top2: '33' })
-    await putMine(alice.cookie, { lotteryId: aliceOwn.id, date: D, top2: '44' })
-    const res = await call('GET', `/admin/results?date=${D}`, { cookie: admin })
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ date: D, results: [official] })
-    const raw = JSON.stringify(official)
-    expect(raw).not.toContain('222')
-    expect(raw).not.toContain(alice.id)
-  })
-
-  it('a date that only has personal results is an empty list for the back office', async () => {
-    await putMine(alice.cookie, { ...draw, top3: '222' })
-    const res = await call('GET', `/admin/results?date=${D}`, { cookie: admin })
-    expect(await res.json()).toEqual({ date: D, results: [] })
-  })
-
-  it('DELETE /results/:id cannot remove a personal result: its id is "not found", and the row stays', async () => {
-    await putMine(alice.cookie, { ...draw, top3: '222' })
-    const [personal] = await rowsOf(alice.id)
-    const res = await call('DELETE', `/results/${personal.id}`, { cookie: admin })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
-    expect(await rowsOf(alice.id)).toEqual([personal])
-    // an official result is removed and the personal one next to it stays
-    const official = (await (await putOfficial({ ...draw, top3: '111' })).json()) as AdminLotteryResult
-    expect((await call('DELETE', `/results/${official.id}`, { cookie: admin })).status).toBe(204)
-    expect(await allRows()).toEqual([personal])
-    expect((await readLottery(alice.cookie, 'hanoi-regular'))[0]).toMatchObject({ top3: '222', mine: true, official: null })
-  })
-
-  it('PUT /results writes the official row next to a personal one for the same draw: 201 (a new row), the personal one is untouched', async () => {
-    await putMine(alice.cookie, { ...draw, top3: '222' })
-    const [personal] = await rowsOf(alice.id)
-    for (const [who, o] of [['the robot key', { key: KEY }], ['an admin', { cookie: admin }]] as const) {
-      await getDb(env).delete(lotteryResults).where(eq(lotteryResults.memberId, ''))
-      const first = await putOfficial({ ...draw, top3: '111' }, o)
-      expect(first.status, who).toBe(201)
-      expect(((await first.json()) as AdminLotteryResult).top3).toBe('111')
-      const second = await putOfficial({ ...draw, top3: '112' }, o)
-      expect(second.status, who).toBe(200) // replaces the official row, not the personal one
-      expect(await rowsOf('')).toMatchObject([{ top3: '112', memberId: '' }])
-      expect((await rowsOf(alice.id))[0], who).toEqual(personal)
-    }
-    // alice keeps reading her own numbers, bob reads the official ones
-    expect((await readLottery(alice.cookie, 'hanoi-regular'))[0]).toMatchObject({ top3: '222', mine: true, official: { time: '', top3: '112', top2: null, bottom2: null } })
-    expect((await readLottery(bob.cookie, 'hanoi-regular'))[0]).toMatchObject({ top3: '112', mine: false })
-    // and the official result applies to her again as soon as hers is removed
-    await delMine(alice.cookie, draw)
-    expect((await readLottery(alice.cookie, 'hanoi-regular'))[0]).toMatchObject({ top3: '112', mine: false })
-  })
-
-  it('the official PUT by lotteryName and the personal PUT by id can name the same draw', async () => {
-    await putMine(alice.cookie, { ...draw, top3: '222' })
-    const res = await putOfficial({ lotteryName: 'ฮานอย ปกติ', date: D, top3: '111' })
-    expect(res.status).toBe(201)
-    expect(await allRows()).toHaveLength(2)
   })
 })
 
@@ -1020,7 +965,7 @@ describe.each([
   it("deleting a member (back office) deletes the member's personal results, those of their own lotteries included, and nobody else's", async () => {
     const dave = await newMember('dave')
     const daveOwn = await newOwnLottery(dave, 'หวยของเดฟ')
-    const official = (await (await putOfficial({ lotteryId: 'hanoi-regular', date: D, top3: '111' })).json()) as AdminLotteryResult
+    const official = (await (await putOfficial({ lotteryId: 'hanoi-regular', date: D, top3: '111' })).json()) as OfficialResult
     await putMine(dave.cookie, { lotteryId: 'hanoi-regular', date: D, top3: '222' })
     await putMine(dave.cookie, { lotteryId: 'hanoi-regular', date: D, time: '09:00', top3: '223' })
     await putMine(dave.cookie, { lotteryId: daveOwn.id, date: D, top2: '33' })

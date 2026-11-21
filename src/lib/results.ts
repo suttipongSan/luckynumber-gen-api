@@ -1,39 +1,22 @@
-// Lottery results (PUT / GET /results, PUT / DELETE /results/mine, GET /admin/results): row -> JSON
-// mappers, the upsert both writers share, which rows a member reads, and the lookups of the lottery
-// a result belongs to.
+// Lottery results as members meet them (GET /results, PUT / DELETE /results/mine): row -> JSON mappers, the upsert
+// of a personal result, which rows a member reads, and the visibility check of the lottery a personal result is about.
+// The OFFICIAL results are written by the results API (numbergen-results-api), which has its own copy of the few
+// helpers it needs (the date guard, the lookup of the catalog lottery, the back office row shape).
 //
 // A row is OFFICIAL (member_id '', written by the back office or the robot) or PERSONAL (member_id =
 // the member who typed it). A member reads the official rows and their own personal ones, never
 // anyone else's, and a personal result hides the official ones of the same lottery and date.
-import { and, asc, eq, inArray, isNull } from 'drizzle-orm'
+import { and, asc, eq, inArray } from 'drizzle-orm'
 import type { DB } from '../db/client'
 import { lotteries, lotteryResults } from '../db/schema'
-import type { AdminLotteryResult, LotteryResult, MemberLotteryResult } from '../types'
-import { ApiError, errors } from './http'
-import { addDays, bangkokDay } from './time'
+import type { LotteryResult, MemberLotteryResult } from '../types'
+import { ApiError } from './http'
 import { visibleToMember } from './views'
 
 export type ResultRow = typeof lotteryResults.$inferSelect
 
 /** The `member_id` of an official result (see the schema: '' and not NULL, so the unique index works). */
 export const OFFICIAL_MEMBER_ID = ''
-
-/**
- * The latest draw date an OFFICIAL result may carry (PUT /results and the import): tomorrow in Bangkok.
- * A draw is dated at most a day ahead (a robot on another time zone is ahead of Bangkok for hours), a
- * result further in the future is a typo and is refused.
- */
-export function latestResultDate(nowMs = Date.now()): string {
-  return addDays(bangkokDay(nowMs), 1)
-}
-
-/** 400 VALIDATION unless `date` (a real YYYY-MM-DD day) is not later than {@link latestResultDate}. */
-export function assertNotTooFarAhead(date: string, nowMs = Date.now()): void {
-  const latest = latestResultDate(nowMs)
-  if (date > latest) {
-    throw errors.validation(`date ล่วงหน้าได้ไม่เกิน 1 วัน (ไม่เกิน ${latest})`)
-  }
-}
 
 /** The shape of one draw's numbers: no id, no source, no timestamps. */
 export function toLotteryResult(r: ResultRow): LotteryResult {
@@ -118,7 +101,7 @@ export async function loadMemberResults(
 }
 
 /**
- * Stores a result, or replaces the one of the same draw and kind (the unique index (lottery, date,
+ * Stores a member's result, or replaces the one of the same draw (the unique index (lottery, date,
  * time, member) decides, so writers racing for one draw end up with one row, the later write wins).
  * A replace keeps the old row's `id` and `created_at`; the new `id` of `row` only survives on an
  * insert, which is how `created` tells the two cases apart. Throws the driver's error when the
@@ -142,53 +125,7 @@ export async function upsertResult(db: DB, row: ResultRow): Promise<{ saved: Res
   return { saved, created: saved.id === row.id }
 }
 
-/** The back office / robot shape: the member shape plus id, source and timestamps. */
-export function toAdminLotteryResult(r: ResultRow): AdminLotteryResult {
-  return {
-    id: r.id,
-    ...toLotteryResult(r),
-    source: r.source,
-    createdAt: r.createdAt,
-    updatedAt: r.updatedAt,
-  }
-}
-
 const lotteryNotFound = (what: string) => new ApiError(404, 'LOTTERY_NOT_FOUND', `ไม่พบหวย: ${what}`)
-
-/**
- * The id of the catalog lottery a PUT /results is about, from its `lotteryId` or its exact
- * `lotteryName` (the schema guarantees that exactly one of them is given). Only catalog lotteries
- * count (`owner_member_id IS NULL`, active or not, so a result can be prepared for a lottery that
- * is switched off): a member's own lottery never has results. The name is compared exactly
- * (case-sensitive, no normalisation) with `lotteries.name`.
- *   - unknown id / name: 404 LOTTERY_NOT_FOUND
- *   - a name that more than one catalog lottery has: 409 LOTTERY_AMBIGUOUS (send the id instead)
- */
-export async function resolveResultLottery(
-  db: DB,
-  ref: { lotteryId?: string | null; lotteryName?: string | null },
-): Promise<string> {
-  if (ref.lotteryId != null) {
-    const [row] = await db
-      .select({ id: lotteries.id })
-      .from(lotteries)
-      .where(and(eq(lotteries.id, ref.lotteryId), isNull(lotteries.ownerMemberId)))
-      .limit(1)
-    if (!row) throw lotteryNotFound(ref.lotteryId)
-    return row.id
-  }
-  const name = ref.lotteryName ?? ''
-  const rows = await db
-    .select({ id: lotteries.id })
-    .from(lotteries)
-    .where(and(eq(lotteries.name, name), isNull(lotteries.ownerMemberId)))
-    .limit(2)
-  if (rows.length === 0) throw lotteryNotFound(name)
-  if (rows.length > 1) {
-    throw errors.conflict('LOTTERY_AMBIGUOUS', `มีหวยชื่อ "${name}" มากกว่าหนึ่งรายการ กรุณาระบุด้วย lotteryId`)
-  }
-  return rows[0].id
-}
 
 /**
  * Throws 404 LOTTERY_NOT_FOUND unless `lotteryId` is a lottery this member can see: an active

@@ -1,34 +1,28 @@
-// Lottery results: PUT /results (robot key or admin; insert, replace, validation, lookup of the
-// lottery by id or exact name), GET /results (what a member may see), GET /admin/results and
-// DELETE /results/:id, migrations 0008 and 0009 (the official results of a database that had them
-// before the personal results came). The members' own results (PUT / DELETE /results/mine, which
-// of the two a member reads) are in memberResults.test.ts. Real libSQL file DB with the project's
-// migrations.
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+// Lottery results as numbergen-api keeps them: migrations 0008 and 0009 (the official results of a database that had
+// them before the personal results came), GET /results (what a member may see) and the delete of a catalog lottery
+// taking its results with it. The official results are WRITTEN by the results API (numbergen-results-api: PUT /results,
+// GET /admin/results, DELETE /results/:id, the import; its tests cover them), so here an official result is a row that is
+// put in the database directly (test/helpers/officialResult.ts). The members' own results (PUT / DELETE /results/mine,
+// which of the two a member reads) are in memberResults.test.ts. Real libSQL file DB with the project's migrations.
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { eq } from 'drizzle-orm'
 import app from '../src/index'
-import type { AdminLottery, AdminLotteryResult, AdminMember, AssetBucket, Bindings, Lottery, MemberLotteryResult } from '../src/types'
+import type { AdminLottery, AdminMember, AssetBucket, Bindings, MemberLotteryResult } from '../src/types'
 import { hashPassword } from '../src/lib/crypto'
 import { resetLimiter } from '../src/lib/loginLimiter'
 import { getDb } from '../src/db/client'
 import { openDb, runMigrations } from '../scripts/db'
 import { LOTTERY_CATALOG } from '../src/db/catalog'
 import { lotteries, lotteryResults } from '../src/db/schema'
-import { resolveResultLottery } from '../src/lib/results'
 import { isCalendarDay } from '../src/lib/time'
-
-// Everything in lib/results is the real code; the wrapper only lets one test make the lottery lookup
-// answer with an id that has just been deleted (see "between the lookup and the write").
-vi.mock('../src/lib/results', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/lib/results')>()
-  return { ...actual, resolveResultLottery: vi.fn(actual.resolveResultLottery) }
-})
+import { putOfficialResult, type OfficialResultInput } from './helpers/officialResult'
 
 const DB_FILE = 'test-results.db'
 const DB_URL = `file:${DB_FILE}`
+// the key of the results robot: not a credential of this API any more (it opens nothing here)
 const KEY = 'test-results-key-0123456789abcdef0123456789abcdef'
 
 const fakeBucket: AssetBucket = {
@@ -73,8 +67,8 @@ function call(method: string, path: string, o: CallOpts = {}) {
   return app.request(path, { method, headers, body: payload }, o.env ?? env)
 }
 
-/** PUT /results; the robot key by default. */
-const put = (body: unknown, o: CallOpts = { key: KEY }) => call('PUT', '/results', { ...o, body })
+/** An official result as the results API stores it (a row, written directly): 201 for a new draw, 200 when it replaced one. */
+const putOfficial = (body: OfficialResultInput) => putOfficialResult(getDb(env), body)
 
 function cookieFrom(res: Response, name: string): string {
   const raw = res.headers.get('set-cookie') ?? ''
@@ -102,16 +96,6 @@ async function newMember(name: string) {
 }
 
 const allResults = () => getDb(env).select().from(lotteryResults)
-
-/** Runs raw SQL on the test database through a second connection (triggers that simulate races). */
-async function sqlite(statement: string) {
-  const { client } = openDb(DB_URL)
-  try {
-    await client.execute(statement)
-  } finally {
-    client.close()
-  }
-}
 
 const getMemberResults = async (cookie: string, date: string) => {
   const res = await call('GET', `/results?date=${date}`, { cookie })
@@ -148,7 +132,6 @@ beforeAll(async () => {
     WEB_URL: 'http://localhost:5173',
     COOKIE_SECURE: 'false',
     ASSETS: fakeBucket,
-    RESULTS_API_KEY: KEY,
   }
   admin = await adminCookie()
   alice = await newMember('alice')
@@ -435,7 +418,7 @@ describe('migration 0009', () => {
     expect((await exec(url, 'pragma table_info(lottery_results)')).map((r) => String(r.name))).toContain('member_id')
   })
 
-  it('the API reads the old rows as official: the back office lists them, members read them as not mine, PUT /results replaces them in place', async () => {
+  it('members read the old rows as official (not mine), a result of the same draw replaces the old row in place, and a member\'s own result lands next to it', async () => {
     const url = await before0009()
     await runMigrations(url)
     const env2: Bindings = { ...env, TURSO_DATABASE_URL: url }
@@ -453,12 +436,6 @@ describe('migration 0009', () => {
     expect(claimed.status).toBe(204)
     const carolCookie = cookieFrom(claimed, 'ng_session')
 
-    const adminList = async (date: string) =>
-      ((await (await call('GET', `/admin/results?date=${date}`, { cookie: adminCookie2, env: env2 })).json()) as { results: AdminLotteryResult[] }).results
-    expect((await adminList('2026-11-19')).map((r) => r.id)).toEqual(['old-3', 'old-2'])
-    expect((await adminList('2026-11-18')).map((r) => r.id)).toEqual(['old-1'])
-    expect((await adminList('2026-11-19'))[1]).toMatchObject({ lotteryId: 'hanoi-regular', time: '16:30', top3: null, top2: '12', bottom2: null, source: null })
-
     const memberRead = async () =>
       ((await (await call('GET', '/results?date=2026-11-19', { cookie: carolCookie, env: env2 })).json()) as { results: MemberLotteryResult[] }).results
     expect(await memberRead()).toEqual([
@@ -466,11 +443,11 @@ describe('migration 0009', () => {
       { lotteryId: 'hanoi-regular', date: '2026-11-19', time: '16:30', top3: null, top2: '12', bottom2: null, mine: false, official: null },
     ])
 
-    // the robot corrects the 16:30 draw: the old row is replaced in place (200, same id and created_at), not duplicated
-    const robot = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', time: '16:30', top3: '321', top2: '12' }, { key: KEY, env: env2 })
+    // the results API corrects the 16:30 draw (here: the same replace, test/helpers/officialResult.ts): the old row is
+    // replaced in place (200, same id and created_at), not duplicated
+    const robot = await putOfficialResult(getDb(env2), { lotteryId: 'hanoi-regular', date: '2026-11-19', time: '16:30', top3: '321', top2: '12' })
     expect(robot.status).toBe(200)
     expect(await robot.json()).toMatchObject({ id: 'old-2', createdAt: '2026-11-19T09:00:00.000Z', top3: '321', top2: '12', bottom2: null })
-    expect(await adminList('2026-11-19')).toHaveLength(2)
 
     // a member now types their own result of the same draw: a row of its own next to the official one
     const mine = await call('PUT', '/results/mine', { cookie: carolCookie, env: env2, body: { lotteryId: 'hanoi-regular', date: '2026-11-19', time: '16:30', bottom2: '77' } })
@@ -478,281 +455,6 @@ describe('migration 0009', () => {
     expect((await memberRead())[1]).toMatchObject({ lotteryId: 'hanoi-regular', mine: true, bottom2: '77', top3: null, official: { time: '16:30', top3: '321', top2: '12', bottom2: null } })
     const rows = await exec(url, "select id, member_id from lottery_results where draw_date = '2026-11-19' order by member_id, id")
     expect(rows.map((r) => `${r.id === 'old-2' || r.id === 'old-3' ? r.id : 'new'}|${r.member_id === '' ? 'official' : 'carol'}`)).toEqual(['old-2|official', 'old-3|official', 'new|carol'])
-    expect(await adminList('2026-11-19')).toHaveLength(2) // the back office still sees only the official ones
-    expect((await call('DELETE', '/results/old-3', { cookie: adminCookie2, env: env2 })).status).toBe(204)
-  })
-})
-
-// ---- upsert and replace --------------------------------------------------------------------------
-
-describe('PUT /results: insert and replace', () => {
-  it('stores a result (201) and answers the stored row', async () => {
-    const res = await put({
-      lotteryId: 'hanoi-regular',
-      date: '2026-11-19',
-      time: '16:30',
-      top3: '042',
-      top2: '57',
-      bottom2: '08',
-      source: 'robot-1',
-    })
-    expect(res.status).toBe(201)
-    const body = (await res.json()) as AdminLotteryResult
-    expect(body).toEqual({
-      id: expect.stringMatching(/^[0-9A-Za-z]{16}$/),
-      lotteryId: 'hanoi-regular',
-      date: '2026-11-19',
-      time: '16:30',
-      top3: '042',
-      top2: '57',
-      bottom2: '08',
-      source: 'robot-1',
-      createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/),
-      updatedAt: body.createdAt,
-    })
-    const rows = await allResults()
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toEqual({
-      id: body.id,
-      lotteryId: 'hanoi-regular',
-      drawDate: '2026-11-19',
-      drawTime: '16:30',
-      memberId: '', // an official result, whoever sent it
-      top3: '042',
-      top2: '57',
-      bottom2: '08',
-      source: 'robot-1',
-      createdAt: body.createdAt,
-      updatedAt: body.updatedAt,
-    })
-  })
-
-  it('a second PUT for the same draw replaces it (200): same id and createdAt, one row', async () => {
-    const first = (await (
-      await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123', top2: '45', bottom2: '67', source: 'a' })
-    ).json()) as AdminLotteryResult
-    await new Promise((r) => setTimeout(r, 5))
-    const res = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '999', top2: '98', bottom2: '97', source: 'b' })
-    expect(res.status).toBe(200)
-    const second = (await res.json()) as AdminLotteryResult
-    expect(second).toMatchObject({ id: first.id, createdAt: first.createdAt, top3: '999', top2: '98', bottom2: '97', source: 'b' })
-    expect(second.updatedAt > first.updatedAt).toBe(true)
-    const rows = await allResults()
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({ id: first.id, top3: '999', top2: '98', bottom2: '97', source: 'b', updatedAt: second.updatedAt })
-  })
-
-  it('replace means the stored draw becomes what was sent: a number that is left out is cleared', async () => {
-    await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123', top2: '45', bottom2: '67', source: 'a' })
-    const res = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', bottom2: '10' })
-    expect(res.status).toBe(200)
-    expect(await res.json()).toMatchObject({ top3: null, top2: null, bottom2: '10', source: null })
-    expect(await allResults()).toHaveLength(1)
-    // null means "not given" as well, and a blank source is no source
-    const nulls = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '321', top2: null, bottom2: null, source: '  ' })
-    expect(await nulls.json()).toMatchObject({ top3: '321', top2: null, bottom2: null, source: null })
-  })
-
-  it('a result may hold just one of the three numbers', async () => {
-    for (const [field, value, time] of [
-      ['top3', '000', ''],
-      ['top2', '00', '10:00'],
-      ['bottom2', '99', '11:00'],
-    ] as const) {
-      const res = await put({ lotteryId: 'dow-jones', date: '2026-11-19', time, [field]: value })
-      expect(res.status, field).toBe(201)
-      expect(await res.json()).toMatchObject({ top3: null, top2: null, bottom2: null, [field]: value })
-    }
-  })
-
-  it('keeps leading zeros (the numbers are strings)', async () => {
-    const res = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '007', top2: '05', bottom2: '00' })
-    expect(await res.json()).toMatchObject({ top3: '007', top2: '05', bottom2: '00' })
-    expect((await getMemberResults(alice.cookie, '2026-11-19')).results[0]).toMatchObject({ top3: '007', top2: '05', bottom2: '00' })
-  })
-
-  it('the draw is (lottery, date, time): another time, date or lottery is another row', async () => {
-    const base = { top2: '12' }
-    const make = async (extra: Record<string, unknown>) => {
-      const res = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', ...base, ...extra })
-      return res.status
-    }
-    expect(await make({})).toBe(201) // time omitted = ''
-    expect(await make({ time: '' })).toBe(200) // '' is the same draw
-    expect(await make({ time: null })).toBe(200) // null too
-    expect(await make({ time: '09:00' })).toBe(201)
-    expect(await make({ time: '16:30' })).toBe(201)
-    expect(await make({ time: '16:30' })).toBe(200)
-    expect(await make({ date: '2026-11-20' })).toBe(201)
-    expect((await put({ lotteryId: 'hanoi-vip', date: '2026-11-19', ...base })).status).toBe(201)
-    const rows = await allResults()
-    expect(rows).toHaveLength(5)
-    expect(rows.map((r) => `${r.lotteryId}|${r.drawDate}|${r.drawTime}`).sort()).toEqual([
-      'hanoi-regular|2026-11-19|',
-      'hanoi-regular|2026-11-19|09:00',
-      'hanoi-regular|2026-11-19|16:30',
-      'hanoi-regular|2026-11-20|',
-      'hanoi-vip|2026-11-19|',
-    ])
-  })
-
-  it('writers racing for one draw leave one row (exactly one of them inserted it)', async () => {
-    const statuses = (
-      await Promise.all(
-        Array.from({ length: 6 }, (_, i) => put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: `${i}${i}${i}` })),
-      )
-    ).map((r) => r.status)
-    expect(statuses.filter((s) => s === 201)).toHaveLength(1)
-    expect(statuses.filter((s) => s === 200)).toHaveLength(5)
-    const rows = await allResults()
-    expect(rows).toHaveLength(1)
-    expect(rows[0].top3).toMatch(/^(\d)\1\1$/)
-  })
-
-  it('source is up to 200 characters, trimmed', async () => {
-    const ok = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top2: '12', source: `  ${'x'.repeat(200)}  ` })
-    expect(((await ok.json()) as AdminLotteryResult).source).toBe('x'.repeat(200))
-    const long = await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top2: '12', source: 'x'.repeat(201) })
-    expect(long.status).toBe(400)
-  })
-})
-
-// ---- validation ----------------------------------------------------------------------------------
-
-describe('PUT /results: validation', () => {
-  const good = { lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123', top2: '45', bottom2: '67' }
-  const errorOf = async (body: unknown) => {
-    const res = await put(body)
-    expect(res.status, JSON.stringify(body)).toBe(400)
-    const json = (await res.json()) as { error: { code: string; message: string } }
-    expect(json.error.code).toBe('VALIDATION')
-    expect(json.error.message).toEqual(expect.any(String))
-    return json.error.message
-  }
-
-  it.each([
-    ['top3', '12'],
-    ['top3', '1234'],
-    ['top3', 'abc'],
-    ['top3', '12a'],
-    ['top3', ' 123'],
-    ['top3', '123 '],
-    ['top3', '1 3'],
-    ['top3', '-12'],
-    ['top3', '1.5'],
-    ['top3', '๑๒๓'], // Thai digits
-    ['top3', '١٢٣'], // Arabic-Indic digits
-    ['top3', '１２３'], // full-width digits
-    ['top3', 123],
-    ['top3', true],
-    ['top3', ['1', '2', '3']],
-    ['top2', '5'],
-    ['top2', '123'],
-    ['top2', 'x1'],
-    ['top2', '4 '],
-    ['top2', 45],
-    ['bottom2', ''],
-    ['bottom2', '1'],
-    ['bottom2', '100'],
-    ['bottom2', '٠١'],
-    ['bottom2', 7],
-  ])('refuses %s = %j and stores nothing', async (field, value) => {
-    const message = await errorOf({ ...good, [field]: value })
-    expect(message).toContain(field)
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('needs at least one of top3 / top2 / bottom2', async () => {
-    await errorOf({ lotteryId: 'hanoi-regular', date: '2026-11-19' })
-    await errorOf({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: null, top2: null, bottom2: null })
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it.each([
-    [undefined],
-    [null],
-    [''],
-    ['2026-13-01'],
-    ['2026-00-10'],
-    ['2026-02-30'],
-    ['2025-02-29'],
-    ['2026-11-31'],
-    ['2026-1-9'],
-    ['26-11-19'],
-    ['2026/11/19'],
-    ['19-11-2026'],
-    [' 2026-11-19'],
-    ['2026-11-19 '],
-    ['2026-11-19T10:00'],
-    ['2026-11-19T00:00:00Z'],
-    ['Nov 19 2026'],
-    ['today'],
-    [20261119],
-  ])('refuses date = %j', async (date) => {
-    const { date: _drop, ...rest } = good
-    void _drop
-    await errorOf(date === undefined ? rest : { ...rest, date })
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('accepts a real leap day', async () => {
-    // a past one: since the future-date guard (see publicAdmin.test.ts) a draw more than a day ahead is refused
-    expect((await put({ ...good, date: '2024-02-29' })).status).toBe(201)
-  })
-
-  it.each([['24:00'], ['9:30'], ['09:5'], ['16:60'], ['16:30:00'], ['1630'], ['16-30'], ['abc'], [' 16:30'], ['16:30 '], ['4:30pm'], [1630], [true]])(
-    'refuses time = %j',
-    async (time) => {
-      const message = await errorOf({ ...good, time })
-      expect(message).toContain('time')
-      expect(await allResults()).toHaveLength(0)
-    },
-  )
-
-  it.each([['00:00'], ['00:01'], ['09:05'], ['12:00'], ['23:59']])('accepts time = %s', async (time) => {
-    const res = await put({ ...good, time })
-    expect(res.status).toBe(201)
-    expect(await res.json()).toMatchObject({ time })
-  })
-
-  it('needs exactly one of lotteryId / lotteryName', async () => {
-    const { lotteryId: _id, ...noLottery } = good
-    void _id
-    await errorOf(noLottery)
-    await errorOf({ ...noLottery, lotteryId: null })
-    await errorOf({ ...noLottery, lotteryId: '' })
-    await errorOf({ ...noLottery, lotteryName: '   ' })
-    await errorOf({ ...noLottery, lotteryName: '' })
-    await errorOf({ ...noLottery, lotteryId: 'hanoi-regular', lotteryName: 'ฮานอย ปกติ' })
-    await errorOf({ ...noLottery, lotteryId: 42 })
-    await errorOf({ ...noLottery, lotteryName: 42 })
-    await errorOf({ ...noLottery, lotteryName: 'x'.repeat(81) })
-    expect(await allResults()).toHaveLength(0)
-    // a null for the one that is not used is fine
-    expect((await put({ ...noLottery, lotteryId: 'hanoi-regular', lotteryName: null })).status).toBe(201)
-  })
-
-  it('refuses unknown fields instead of dropping them silently', async () => {
-    const message = await errorOf({ ...good, bottom_2: '67' })
-    expect(message).toContain('bottom_2')
-    await errorOf({ ...good, draw_date: '2026-11-19' })
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('refuses a body that is not a JSON object', async () => {
-    // strings are sent as they are, so these are raw request bodies
-    for (const body of ['not json', '[]', 'null', '"text"', '42', '']) {
-      const res = await put(body)
-      expect(res.status, JSON.stringify(body)).toBe(400)
-      expect(await res.json()).toMatchObject({ error: { code: 'VALIDATION' } })
-    }
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('checks the body before looking up the lottery', async () => {
-    // a bad digit and an unknown lottery: the validation error wins (400, not 404)
-    const res = await put({ ...good, lotteryId: 'nope', top3: '12' })
-    expect(res.status).toBe(400)
   })
 })
 
@@ -767,226 +469,6 @@ describe('unit: isCalendarDay', () => {
   })
 })
 
-// ---- which lottery -------------------------------------------------------------------------------
-
-describe('PUT /results: the lottery by id or exact name', () => {
-  const draw = { date: '2026-11-19', top3: '123', top2: '45', bottom2: '67' }
-
-  it('finds a catalog lottery by its exact name', async () => {
-    const res = await put({ lotteryName: 'ฮานอย ปกติ', ...draw })
-    expect(res.status).toBe(201)
-    expect(await res.json()).toMatchObject({ lotteryId: 'hanoi-regular' })
-    // the same draw by id is the same row
-    const again = await put({ lotteryId: 'hanoi-regular', ...draw, top3: '999' })
-    expect(again.status).toBe(200)
-    expect(await allResults()).toHaveLength(1)
-    // surrounding whitespace in the request is ignored, the name itself must match exactly
-    expect((await put({ lotteryName: '  ฮานอย ปกติ\n', ...draw })).status).toBe(200)
-    expect((await put({ lotteryName: 'ดาวโจนส์ VIP', ...draw })).status).toBe(201)
-    expect((await allResults()).map((r) => r.lotteryId).sort()).toEqual(['dow-jones-vip', 'hanoi-regular'])
-  })
-
-  it.each([
-    ['ฮานอย'], // part of a name
-    ['ฮานอยปกติ'], // the short name
-    ['ฮานอย  ปกติ'], // double space inside
-    ['hanoi-regular'], // an id is not a name
-    ['ดาวโจนส์ vip'], // other case
-    ['ไม่มีหวยนี้'],
-  ])('unknown name %j: 404 LOTTERY_NOT_FOUND and nothing is stored', async (name) => {
-    const res = await put({ lotteryName: name, ...draw })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toMatchObject({ error: { code: 'LOTTERY_NOT_FOUND', message: expect.any(String) } })
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('unknown id: 404 LOTTERY_NOT_FOUND and nothing is stored', async () => {
-    const res = await put({ lotteryId: 'no-such-lottery', ...draw })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toMatchObject({ error: { code: 'LOTTERY_NOT_FOUND' } })
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('a name that two catalog lotteries share is ambiguous (409 LOTTERY_AMBIGUOUS); the id still works', async () => {
-    const twin = await call('POST', '/admin/lotteries', {
-      cookie: admin,
-      body: { name: 'ฮานอย ปกติ', shortName: 'ฮานอยปกติ2', group: 'hanoi', accent: '#be123c', sortOrder: 9999, active: true },
-    })
-    expect(twin.status).toBe(200)
-    const twinId = ((await twin.json()) as AdminLottery).id
-    try {
-      const res = await put({ lotteryName: 'ฮานอย ปกติ', ...draw })
-      expect(res.status).toBe(409)
-      expect(await res.json()).toMatchObject({ error: { code: 'LOTTERY_AMBIGUOUS', message: expect.stringContaining('lotteryId') } })
-      expect(await allResults()).toHaveLength(0)
-      expect((await put({ lotteryId: twinId, ...draw })).status).toBe(201)
-      expect((await put({ lotteryId: 'hanoi-regular', ...draw })).status).toBe(201)
-    } finally {
-      expect((await call('DELETE', `/admin/lotteries/${twinId}`, { cookie: admin })).status).toBe(204)
-    }
-    // the twin's result went with it, and the name is unique again
-    expect((await allResults()).map((r) => r.lotteryId)).toEqual(['hanoi-regular'])
-    expect((await put({ lotteryName: 'ฮานอย ปกติ', ...draw })).status).toBe(200)
-  })
-
-  it("a member's own lottery has no results: not by id, and its name does not make a catalog name ambiguous", async () => {
-    const mine = await call('POST', '/lotteries', { cookie: alice.cookie, body: { name: 'ฮานอย ปกติ', group: 'hanoi' } })
-    expect(mine.status).toBe(200)
-    const own = (await mine.json()) as Lottery
-    const solo = await call('POST', '/lotteries', { cookie: alice.cookie, body: { name: 'หวยของอลิซ', group: 'other' } })
-    const soloId = ((await solo.json()) as Lottery).id
-    try {
-      const byId = await put({ lotteryId: own.id, ...draw })
-      expect(byId.status).toBe(404)
-      expect(await byId.json()).toMatchObject({ error: { code: 'LOTTERY_NOT_FOUND' } })
-      expect((await put({ lotteryName: 'หวยของอลิซ', ...draw })).status).toBe(404)
-      // the catalog lottery with the same name is still found
-      const byName = await put({ lotteryName: 'ฮานอย ปกติ', ...draw })
-      expect(byName.status).toBe(201)
-      expect(await byName.json()).toMatchObject({ lotteryId: 'hanoi-regular' })
-      expect(await allResults()).toHaveLength(1)
-    } finally {
-      await call('DELETE', `/lotteries/${own.id}`, { cookie: alice.cookie })
-      await call('DELETE', `/lotteries/${soloId}`, { cookie: alice.cookie })
-    }
-  })
-
-  it('a catalog lottery that is switched off can still be given a result', async () => {
-    await setActive('hanoi-vip', false)
-    try {
-      expect((await put({ lotteryId: 'hanoi-vip', ...draw })).status).toBe(201)
-      expect((await put({ lotteryName: 'ฮานอย VIP', ...draw })).status).toBe(200)
-      expect(await allResults()).toHaveLength(1)
-    } finally {
-      await setActive('hanoi-vip', true)
-    }
-  })
-
-  it('a lottery that is deleted by someone else between the lookup and the write is 404, not a 500', async () => {
-    // The first lookup answers with an id that is gone by the time of the insert, exactly what an
-    // admin deleting the lottery in between would cause: the FOREIGN KEY of the insert fails and the
-    // route looks the lottery up again (the real lookup, which finds nothing).
-    vi.mocked(resolveResultLottery).mockImplementationOnce(async () => 'deleted-meanwhile')
-    const res = await put({ lotteryId: 'hanoi-regular', ...draw })
-    expect(res.status).toBe(404)
-    expect(await res.json()).toMatchObject({ error: { code: 'LOTTERY_NOT_FOUND', message: expect.stringContaining('deleted-meanwhile') } })
-    expect(await allResults()).toHaveLength(0)
-    // the stub was used up: the next request resolves the lottery for real
-    expect((await put({ lotteryId: 'hanoi-regular', ...draw })).status).toBe(201)
-  })
-
-  it('any other failure of the write is a real error (500 INTERNAL), not a made-up 404', async () => {
-    await sqlite(
-      `CREATE TRIGGER boom BEFORE INSERT ON lottery_results WHEN NEW.draw_date = '2025-12-31'
-       BEGIN SELECT RAISE(ABORT, 'boom'); END`,
-    )
-    const log = vi.spyOn(console, 'error').mockImplementation(() => {})
-    try {
-      const res = await put({ lotteryId: 'hanoi-regular', ...draw, date: '2025-12-31' })
-      expect(res.status).toBe(500)
-      expect(await res.json()).toMatchObject({ error: { code: 'INTERNAL' } })
-    } finally {
-      log.mockRestore()
-      await sqlite('DROP TRIGGER boom')
-    }
-    expect(await allResults()).toHaveLength(0)
-    // and the endpoint works again once the cause is gone
-    expect((await put({ lotteryId: 'hanoi-regular', ...draw, date: '2025-12-31' })).status).toBe(201)
-  })
-})
-
-// ---- who may write -------------------------------------------------------------------------------
-
-describe('PUT /results: the API key or an admin', () => {
-  const body = { lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123' }
-  const refused = async (res: Response) => {
-    expect(res.status).toBe(401)
-    expect(await res.json()).toMatchObject({ error: { code: 'UNAUTHENTICATED', message: expect.any(String) } })
-    expect(await allResults()).toHaveLength(0)
-  }
-
-  it('the key alone is enough (no cookie, no Origin)', async () => {
-    const res = await put(body, { key: KEY })
-    expect(res.status).toBe(201)
-    // header names are case-insensitive
-    const lower = await call('PUT', '/results', { headers: { 'x-api-key': KEY }, body })
-    expect(lower.status).toBe(200)
-  })
-
-  it('a signed-in admin is enough (no key)', async () => {
-    const res = await put(body, { cookie: admin })
-    expect(res.status).toBe(201)
-    // a wrong key does not matter when the admin cookie is good
-    expect((await put(body, { cookie: admin, key: 'wrong' })).status).toBe(200)
-  })
-
-  it('neither: 401', async () => {
-    await refused(await put(body, {}))
-  })
-
-  it('a wrong key: 401, whatever is different about it', async () => {
-    for (const key of [
-      'wrong',
-      '',
-      ' ',
-      KEY.slice(0, -1), // one character short
-      `${KEY}x`, // one too long
-      `${KEY.slice(0, -1)}${KEY.endsWith('f') ? 'e' : 'f'}`, // last character differs
-      KEY.toUpperCase(),
-    ]) {
-      const res = await put(body, { key })
-      expect(res.status, JSON.stringify(key)).toBe(401)
-    }
-    expect(await allResults()).toHaveLength(0)
-  })
-
-  it('the key must be in X-API-Key: Authorization and query strings do not count', async () => {
-    await refused(await call('PUT', '/results', { headers: { Authorization: `Bearer ${KEY}` }, body }))
-    await refused(await call('PUT', `/results?key=${KEY}&api_key=${KEY}`, { body }))
-    await refused(await call('PUT', '/results', { headers: { 'X-Api-Token': KEY }, body }))
-  })
-
-  it('a member session is not a writer, with or without a wrong key', async () => {
-    await refused(await put(body, { cookie: alice.cookie }))
-    await refused(await put(body, { cookie: alice.cookie, key: 'wrong' }))
-  })
-
-  it('refuses everything while the secret is unset (an empty header is not equal to an empty secret)', async () => {
-    const { RESULTS_API_KEY: _drop, ...rest } = env
-    void _drop
-    const unset: Bindings = rest
-    for (const key of [KEY, 'anything', '', ' ', 'undefined']) {
-      const res = await put(body, { key, env: unset })
-      expect(res.status, JSON.stringify(key)).toBe(401)
-    }
-    expect((await put(body, { env: unset })).status).toBe(401)
-    for (const secret of ['', '   ', '\t\n']) {
-      for (const key of ['', ' ', secret, KEY]) {
-        const res = await put(body, { key, env: { ...env, RESULTS_API_KEY: secret } })
-        expect(res.status, `secret ${JSON.stringify(secret)} key ${JSON.stringify(key)}`).toBe(401)
-      }
-    }
-    expect(await allResults()).toHaveLength(0)
-    // an admin can still write: only the key path is closed
-    expect((await put(body, { cookie: admin, env: unset })).status).toBe(201)
-  })
-
-  it('a configured secret is compared after trimming it, so a stray newline from `secret put` does not lock the robot out', async () => {
-    const res = await put(body, { key: KEY, env: { ...env, RESULTS_API_KEY: `${KEY}\n` } })
-    expect(res.status).toBe(201)
-  })
-
-  it('from a foreign Origin a write is 403 even with the key (the robot sends no Origin); an allowed Origin passes', async () => {
-    const forged = await put(body, { key: KEY, headers: { Origin: 'https://evil.example' } })
-    expect(forged.status).toBe(403)
-    expect(await allResults()).toHaveLength(0)
-    const ok = await put(body, { cookie: admin, headers: { Origin: 'http://localhost:5173' } })
-    expect(ok.status).toBe(201)
-    const forgedAdmin = await put({ ...body, top3: '999' }, { cookie: admin, headers: { Origin: 'https://evil.example' } })
-    expect(forgedAdmin.status).toBe(403)
-    expect((await allResults())[0].top3).toBe('123')
-  })
-})
 
 // ---- GET /results (member) -----------------------------------------------------------------------
 
@@ -999,7 +481,7 @@ describe('GET /results', () => {
       { lotteryId: 'dow-jones', date: '2026-11-19', time: '', top3: '555' },
       { lotteryId: 'hanoi-regular', date: '2026-11-20', top3: '777' },
     ]) {
-      expect((await put(r)).status).toBe(201)
+      expect((await putOfficial(r)).status).toBe(201)
     }
   }
 
@@ -1025,6 +507,11 @@ describe('GET /results', () => {
     ])
   })
 
+  it('keeps leading zeros (the numbers are strings)', async () => {
+    await putOfficial({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '007', top2: '05', bottom2: '00' })
+    expect((await getMemberResults(alice.cookie, '2026-11-19')).results[0]).toMatchObject({ top3: '007', top2: '05', bottom2: '00' })
+  })
+
   it('answers an empty list for a date without results', async () => {
     await seed()
     expect(await getMemberResults(alice.cookie, '2026-11-21')).toEqual({ date: '2026-11-21', results: [] })
@@ -1041,9 +528,8 @@ describe('GET /results', () => {
     try {
       const hidden = await getMemberResults(alice.cookie, '2026-11-19')
       expect(hidden.results.map((r) => r.lotteryId)).toEqual(['hanoi-regular'])
-      // the back office still sees everything
-      const adminList = await call('GET', '/admin/results?date=2026-11-19', { cookie: admin })
-      expect(((await adminList.json()) as { results: unknown[] }).results).toHaveLength(4)
+      // the rows are still there (the back office, which is the results API's, lists them all)
+      expect((await allResults()).filter((r) => r.drawDate === '2026-11-19')).toHaveLength(4)
     } finally {
       await setActive('dow-jones', true)
     }
@@ -1080,84 +566,9 @@ describe('GET /results', () => {
 
   it('a replaced result shows at once (no caching in the API)', async () => {
     await seed()
-    await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '000' })
+    await putOfficial({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '000' })
     const hanoi = (await getMemberResults(alice.cookie, '2026-11-19')).results.find((r) => r.lotteryId === 'hanoi-regular')
     expect(hanoi).toMatchObject({ top3: '000', top2: null, bottom2: null })
-  })
-})
-
-// ---- GET /admin/results --------------------------------------------------------------------------
-
-describe('GET /admin/results', () => {
-  it('lists every result of the date with id, source and timestamps (the shape the form needs)', async () => {
-    const a = (await (await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123', source: 'robot' })).json()) as AdminLotteryResult
-    const b = (await (await put({ lotteryId: 'dow-jones', date: '2026-11-19', time: '21:00', top2: '08' })).json()) as AdminLotteryResult
-    await put({ lotteryId: 'dow-jones', date: '2026-11-20', top2: '99' })
-    const res = await call('GET', '/admin/results?date=2026-11-19', { cookie: admin })
-    expect(res.status).toBe(200)
-    expect(await res.json()).toEqual({ date: '2026-11-19', results: [b, a] })
-    expect(((await (await call('GET', '/admin/results?date=2026-11-22', { cookie: admin })).json()) as { results: unknown[] }).results).toEqual([])
-  })
-
-  it('needs an admin session: not a member, not the key, not nothing', async () => {
-    const path = '/admin/results?date=2026-11-19'
-    expect((await call('GET', path)).status).toBe(401)
-    expect((await call('GET', path, { cookie: alice.cookie })).status).toBe(401)
-    expect((await call('GET', path, { key: KEY })).status).toBe(401)
-  })
-
-  it('needs a valid date', async () => {
-    for (const q of ['', '?date=', '?date=2026-13-01', '?date=nope']) {
-      const res = await call('GET', `/admin/results${q}`, { cookie: admin })
-      expect(res.status, q).toBe(400)
-    }
-  })
-})
-
-// ---- DELETE /results/:id -------------------------------------------------------------------------
-
-describe('DELETE /results/:id', () => {
-  const draw = { lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123' }
-
-  it('an admin deletes a result (204); it is gone for members and can be created again', async () => {
-    const first = (await (await put(draw)).json()) as AdminLotteryResult
-    expect((await getMemberResults(alice.cookie, '2026-11-19')).results).toHaveLength(1)
-    const res = await call('DELETE', `/results/${first.id}`, { cookie: admin })
-    expect(res.status).toBe(204)
-    expect(await res.text()).toBe('')
-    expect(await allResults()).toHaveLength(0)
-    expect((await getMemberResults(alice.cookie, '2026-11-19')).results).toEqual([])
-    const again = await put(draw)
-    expect(again.status).toBe(201)
-    expect(((await again.json()) as AdminLotteryResult).id).not.toBe(first.id)
-  })
-
-  it('deletes only that result', async () => {
-    const a = (await (await put(draw)).json()) as AdminLotteryResult
-    await put({ ...draw, time: '09:00' })
-    await put({ ...draw, lotteryId: 'hanoi-vip' })
-    expect((await call('DELETE', `/results/${a.id}`, { cookie: admin })).status).toBe(204)
-    expect((await allResults()).map((r) => `${r.lotteryId}|${r.drawTime}`).sort()).toEqual(['hanoi-regular|09:00', 'hanoi-vip|'])
-  })
-
-  it('an unknown or already deleted id is 404', async () => {
-    const first = (await (await put(draw)).json()) as AdminLotteryResult
-    expect((await call('DELETE', `/results/${first.id}`, { cookie: admin })).status).toBe(204)
-    const again = await call('DELETE', `/results/${first.id}`, { cookie: admin })
-    expect(again.status).toBe(404)
-    expect(await again.json()).toMatchObject({ error: { code: 'NOT_FOUND' } })
-    expect((await call('DELETE', '/results/nope', { cookie: admin })).status).toBe(404)
-  })
-
-  it('admin only: the key, a member and a stranger get 401 and the result stays', async () => {
-    const first = (await (await put(draw)).json()) as AdminLotteryResult
-    const path = `/results/${first.id}`
-    expect((await call('DELETE', path, { key: KEY })).status).toBe(401)
-    expect((await call('DELETE', path, { cookie: alice.cookie })).status).toBe(401)
-    expect((await call('DELETE', path)).status).toBe(401)
-    // not even from a foreign Origin with the admin cookie
-    expect((await call('DELETE', path, { cookie: admin, headers: { Origin: 'https://evil.example' } })).status).toBe(403)
-    expect(await allResults()).toHaveLength(1)
   })
 })
 
@@ -1170,9 +581,9 @@ describe('deleting a catalog lottery', () => {
       body: { name: 'หวยทดสอบผล', shortName: 'ทดสอบผล', group: 'other', accent: '#4c1d95', sortOrder: 9997, active: true },
     })
     const id = ((await created.json()) as AdminLottery).id
-    expect((await put({ lotteryId: id, date: '2026-11-19', top3: '123' })).status).toBe(201)
-    expect((await put({ lotteryId: id, date: '2026-11-19', time: '10:00', top2: '12' })).status).toBe(201)
-    expect((await put({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123' })).status).toBe(201)
+    expect((await putOfficial({ lotteryId: id, date: '2026-11-19', top3: '123' })).status).toBe(201)
+    expect((await putOfficial({ lotteryId: id, date: '2026-11-19', time: '10:00', top2: '12' })).status).toBe(201)
+    expect((await putOfficial({ lotteryId: 'hanoi-regular', date: '2026-11-19', top3: '123' })).status).toBe(201)
     expect(await allResults()).toHaveLength(3)
 
     expect((await call('DELETE', `/admin/lotteries/${id}`, { cookie: admin })).status).toBe(204)
